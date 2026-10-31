@@ -68,9 +68,7 @@ The server binds to loopback. For containers or remote deployments, use a reacha
 
 ## Services, objects and workflows
 
-- `Restate.service` is stateless.
-- `Restate.object` has state per key. Handlers are exclusive by default; `Restate.shared` handlers can only read.
-- `Restate.workflow` runs once per key, with shared handlers to query its state.
+Define typed contracts for Restate services, virtual objects and workflows with `Restate.service`, `Restate.object` and `Restate.workflow`.
 
 Use `Restate.client(contract).key(id)` to call an object or workflow. Inside their handlers, `Restate.key` gives the key and `Restate.state` reads and writes state.
 
