@@ -13,12 +13,14 @@ export interface InvocationState {
 }
 /** Attempt-local service. Never put this in an application-wide Layer. */
 export class Invocation extends Context.Service<Invocation, InvocationState>()("restate-effect/Invocation") {}
+/** Provided to object and workflow handlers: they have a key. */
+export class Keyed extends Context.Service<Keyed, InvocationState>()("restate-effect/Keyed") {}
 /** Provided to object and workflow handlers: they have a key and state. */
 export class StateReader extends Context.Service<StateReader, InvocationState>()("restate-effect/StateReader") {}
 /** Provided to exclusive object handlers and workflow `run`: they can write state. */
 export class StateWriter extends Context.Service<StateWriter, InvocationState>()("restate-effect/StateWriter") {}
 
-export function invocationState(ctx: sdk.Context, stateful: boolean, writable: boolean, onDefect: "pause" | "fail" = "pause"): InvocationState {
+export function invocationState(ctx: sdk.Context, stateful: boolean, writable: boolean, onDefect: "pause" | "fail"): InvocationState {
   let pending = false
   const assertReady = () => {
     if (ctx.request().attemptCompletedSignal.aborted) throw new Error("Restate attempt has ended")
@@ -34,5 +36,3 @@ export function invocationState(ctx: sdk.Context, stateful: boolean, writable: b
     }
   }
 }
-/** Provided to object and workflow handlers: they have a key. */
-export class Keyed extends Context.Service<Keyed, InvocationState>()("restate-effect/Keyed") {}

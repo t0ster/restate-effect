@@ -1,13 +1,13 @@
 import { Context, Duration, Effect, Layer, Schema } from "effect"
-import { Headers, HttpTraceContext } from "effect/http"
+import { HttpTraceContext } from "effect/http"
 import * as ingressSdk from "@restatedev/restate-sdk-clients"
 import * as sdk from "@restatedev/restate-sdk"
-import { decodeFailure, serde } from "./codec.js"
+import { cachedSerde, decodeFailure } from "./codec.js"
 import type { AnyContract, Handler, Handlers } from "./contract.js"
-import { DeclaredFailure, Durable, isCancellation } from "./durable.js"
+import { millis } from "./duration.js"
+import { Durable, decodeRejection, isCancellation } from "./durable.js"
 import type { InvocationState } from "./invocation.js"
 import { ClientError } from "./errors.js"
-export { ClientError } from "./errors.js"
 
 /** A Restate invocation ID: a branded string, so it can be stored, sent and decoded like any value. */
 export const InvocationId = Schema.String.pipe(Schema.brand("restate-effect/InvocationId"))
@@ -100,21 +100,15 @@ function perform(transport: Context.Service.Shape<typeof Transport>, call: Call)
  * protocol. A callee's undeclared failure is a remote defect, so it rejects as is and dies.
  */
 function issue(invocation: InvocationState, call: Call): sdk.RestatePromise<unknown> {
-  return command(invocation.ctx, call).map((value, failure) => {
-    if (failure === undefined) return value
-    if (isCancellation(failure)) throw failure
-    const decoded = decodeFailure(failure, call.handler.error)
-    if (decoded) throw new DeclaredFailure(decoded.value)
-    throw failure
-  })
+  return decodeRejection(command(invocation.ctx, call), failure => decodeFailure(failure, call.handler.error))
 }
 
 /** The SDK command for a call or attach. A workflow's run is called directly here: it does not join. */
 function command(ctx: sdk.Context, call: Call): sdk.RestatePromise<unknown> {
-  if (call.operation === "attach") return ctx.invocation(call.invocationId as unknown as sdk.InvocationId).attach(serde(call.handler.success))
+  if (call.operation === "attach") return ctx.invocation(call.invocationId as unknown as sdk.InvocationId).attach(cachedSerde(call.handler.success))
   return ctx.genericCall({
     service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
-    inputSerde: serde(call.handler.input), outputSerde: serde(call.handler.success),
+    inputSerde: cachedSerde(call.handler.input), outputSerde: cachedSerde(call.handler.success),
     idempotencyKey: call.options?.idempotencyKey, headers: call.options?.headers
   })
 }
@@ -174,7 +168,6 @@ export const Client = {
 }
 
 const isWorkflowRun = (call: Call) => call.contract.kind === "workflow" && call.method === "run"
-const millis = (delay: Duration.Input | undefined) => delay === undefined ? undefined : Duration.toMillis(delay)
 
 export const ingressTransport = (ingress: ingressSdk.Ingress): Context.Service.Shape<typeof Transport> => ({
   call: call => Effect.useSpan(`${call.contract.name}/${call.method}`, { kind: "client" }, span => Effect.tryPromise({
@@ -183,15 +176,15 @@ export const ingressTransport = (ingress: ingressSdk.Ingress): Context.Service.S
       const headers = { ...Object.fromEntries(Object.entries(HttpTraceContext.toHeaders(span))), ...call.options?.headers }
       const target = { service: call.contract.name, handler: call.method, key: call.key }
       const send = () => ingress.send({ ...target, parameter: call.input, opts: ingressSdk.rpc.sendOpts({
-        idempotencyKey: call.options?.idempotencyKey, headers, delay: millis(call.options?.delay), input: serde(call.handler.input)
+        idempotencyKey: call.options?.idempotencyKey, headers, delay: millis(call.options?.delay), input: cachedSerde(call.handler.input)
       }) })
-      const result = (invocationId: string) => ingress.result({ invocationId, attachable: true } as ingressSdk.Send, serde(call.handler.success))
+      const result = (invocationId: string) => ingress.result({ invocationId, attachable: true } as ingressSdk.Send, cachedSerde(call.handler.success))
       if (call.operation === "send") return (await send()).invocationId
       if (call.operation === "attach") return result(call.invocationId!)
       // A workflow runs once per key: send (which joins a started run), then wait for it.
       if (isWorkflowRun(call)) return result((await send()).invocationId)
       return ingress.call({ ...target, parameter: call.input, opts: ingressSdk.rpc.opts({
-        idempotencyKey: call.options?.idempotencyKey, headers, signal, input: serde(call.handler.input), output: serde(call.handler.success)
+        idempotencyKey: call.options?.idempotencyKey, headers, signal, input: cachedSerde(call.handler.input), output: cachedSerde(call.handler.success)
       }) })
     },
     catch: cause => clientError(call, cause)
@@ -209,7 +202,7 @@ export const invocationTransport = (
     try: () => execute(async () => {
       const send = () => ctx.genericSend({
         service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
-        inputSerde: serde(call.handler.input), delay: millis(call.options?.delay),
+        inputSerde: cachedSerde(call.handler.input), delay: millis(call.options?.delay),
         idempotencyKey: call.options?.idempotencyKey, headers: call.options?.headers
       }).invocationId
       if (call.operation === "send") return send()
@@ -220,7 +213,3 @@ export const invocationTransport = (
     catch: cause => clientError(call, cause)
   })
 })
-
-/** Header map of the attempt, for trace context. */
-export const attemptHeaders = (ctx: sdk.Context) => Headers.fromInput(Object.fromEntries(ctx.request().attemptHeaders ?? []))
-export const parentSpan = (ctx: sdk.Context) => HttpTraceContext.fromHeaders(attemptHeaders(ctx))

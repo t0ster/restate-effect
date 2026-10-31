@@ -1,6 +1,7 @@
 import { Cause, Context, Effect, Effectable, Result } from "effect"
 import type { Pipeable } from "effect"
 import * as sdk from "@restatedev/restate-sdk"
+import { singleFailure } from "./codec.js"
 import { Invocation, type InvocationState } from "./invocation.js"
 import type { ClientError } from "./errors.js"
 import type { Transport } from "./client.js"
@@ -16,6 +17,22 @@ export class DeclaredFailure extends sdk.TerminalError {
 /** Restate's code for a cancelled invocation; a caller sees it as a plain TerminalError. */
 export const isCancellation = (error: unknown) =>
   error instanceof sdk.CancelledError || (error instanceof sdk.TerminalError && error.code === 409 && error.message === "Cancelled")
+
+/**
+ * Rejects with a DeclaredFailure when `decode` finds one in the promise's TerminalError; any other
+ * failure (cancellation, a remote defect) rejects as is.
+ */
+export const decodeRejection = <A>(
+  promise: sdk.RestatePromise<A>,
+  decode: (failure: sdk.TerminalError) => { readonly value: unknown } | undefined
+): sdk.RestatePromise<A> =>
+  promise.map((value, failure) => {
+    if (failure === undefined) return value as A
+    if (isCancellation(failure)) throw failure
+    const declared = decode(failure)
+    if (declared) throw new DeclaredFailure(declared.value)
+    throw failure
+  })
 
 /** How a rejected durable operation continues in Effect: typed failure, interruption, or defect. */
 export function fromRejection<E>(error: unknown): Effect.Effect<never, E> {
@@ -101,11 +118,10 @@ export const mapError = <E, E2>(f: (e: Exclude<E, ClientError>) => E2) => <A, R>
 
 /** Like `Effect.filterOrFail`: fails with `orFail(value)` when `predicate` rejects the value. */
 export const filterOrFail = <A, E2>(predicate: (a: A) => boolean, orFail: (a: A) => E2) => <E, R>(self: Durable<A, E, R>): Durable<A, Exclude<E, ClientError> | E2, Inside<R>> =>
-  new Durable((invocation, context) => self.issue(invocation, context as never).map((value, failure) => {
-    if (failure !== undefined) throw failure
-    if (!predicate(value as A)) throw new DeclaredFailure(orFail(value as A))
-    return value as A
-  }))
+  map((value: A) => {
+    if (!predicate(value)) throw new DeclaredFailure(orFail(value))
+    return value
+  })(self)
 
 /** A durable operation already started by `fork`; joining it starts nothing new. */
 export interface Fiber<A, E = never> {
@@ -129,6 +145,6 @@ export const join = <A, E>(fiber: Fiber<A, E>): Durable<A, E, Invocation> => new
 export const isFinal = (invocation: InvocationState, cause: Cause.Cause<unknown>): boolean => {
   if (invocation.ctx.request().attemptCompletedSignal.aborted) return false
   if (Cause.hasInterruptsOnly(cause)) return true                                    // cancellation
-  if (cause.reasons.length === 1 && Cause.isFailReason(cause.reasons[0])) return true  // declared failure
+  if (singleFailure(cause)) return true                                              // declared failure
   return invocation.onDefect === "fail"                                              // defect
 }

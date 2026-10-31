@@ -1,18 +1,25 @@
-import { Cause, Context, Duration, Effect, Exit, Layer, Logger, Option } from "effect"
-import { HttpEffect, HttpRouter } from "effect/http"
+import { Cause, Context, Effect, Exit, Layer, Logger, Option } from "effect"
+import { Headers, HttpEffect, HttpRouter, HttpTraceContext } from "effect/http"
 import * as sdk from "@restatedev/restate-sdk"
 import * as fetchSdk from "@restatedev/restate-sdk/fetch"
-import { serde, unwrapExit } from "./codec.js"
+import { cachedSerde, singleFailure, unwrapExit } from "./codec.js"
 import type { BoundHandlers, Contract, HandlerServerOptions, Handlers, Kind, RetryPolicy } from "./contract.js"
+import { millis } from "./duration.js"
 import { Invocation, Keyed, StateReader, StateWriter, invocationState } from "./invocation.js"
-import { Transport, invocationTransport, parentSpan } from "./client.js"
+import { Transport, invocationTransport } from "./client.js"
 
 type Definition = sdk.ServiceDefinition<string, unknown> | sdk.VirtualObjectDefinition<string, unknown> | sdk.WorkflowDefinition<string, unknown>
+
+/** The services the adapter provides to each handler attempt: never taken from application Layers. */
+export type InvocationServices = Invocation | Transport | StateReader | StateWriter | Keyed
+/** Removes `InvocationServices` from a context. */
+export const omitInvocationServices = Context.omit(Invocation, Transport, StateReader, StateWriter, Keyed)
 
 /** The SDK definition of an implemented contract. Its handlers run with the services captured in `bound`. */
 export function definition<N extends string, H extends Handlers, K extends Kind>(contract: Contract<N, H, K>, bound: BoundHandlers<H>): Definition {
     const { handlers: overrides = {}, workflowRetention, ...shared } = bound.options
     const stateful = contract.kind !== "service"
+    const services = omitInvocationServices(bound.context)
     const handlers: Record<string, any> = {}
     for (const [method, handler] of Object.entries(contract.handlers)) {
       const own: HandlerServerOptions = (overrides as Record<string, HandlerServerOptions | undefined>)[method] ?? {}
@@ -20,7 +27,7 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
       const execute = async (ctx: sdk.Context, input: unknown) => {
         const invocation = invocationState(ctx, stateful, stateful && handler.mode !== "shared", onDefect)
         let context = Context.add(
-          Context.add(Context.omit(Invocation, Transport, StateReader, StateWriter, Keyed)(bound.context), Invocation, invocation),
+          Context.add(services, Invocation, invocation),
           Transport, invocationTransport(ctx, invocation.execute)
         )
         if (invocation.stateful) context = Context.add(Context.add(context, StateReader, invocation), Keyed, invocation)
@@ -31,7 +38,7 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
         const program = Effect.scoped(Effect.suspend(() => bound.handlers[method](input))).pipe(
           Effect.withSpan(`${contract.name}/${method}`, {
             kind: "server",
-            parent: request.attemptHeaders ? Option.getOrUndefined(parentSpan(ctx)) : undefined,
+            parent: parentSpan(request),
             attributes: request.id ? { "restate.invocation.id": request.id } : {}
           })
         )
@@ -39,8 +46,9 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
         const exit = await Effect.runPromiseExitWith(context)(program, { signal })
         if (Exit.isFailure(exit) && !signal.aborted) {
           // Interrupted, not by the end of the attempt: cancelled, so the invocation ends as cancelled.
-          if (Cause.hasInterruptsOnly(exit.cause)) throw new sdk.TerminalError("Cancelled", { errorCode: 409 })
-          if (onDefect === "fail" && isDefect(exit.cause)) {
+          if (Cause.hasInterruptsOnly(exit.cause)) throw new sdk.CancelledError()
+          // A defect: anything but a single declared failure (or a client error).
+          if (onDefect === "fail" && !singleFailure(exit.cause)) {
             ctx.console.error(`${contract.name}/${method} failed with a defect`, Cause.pretty(exit.cause))
             throw new sdk.TerminalError("Internal error")
           }
@@ -53,8 +61,8 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
         ...sdkOptions(own),
         retryPolicy: onDefect === "pause" ? { ...retryPolicy(own.retryPolicy), onMaxAttempts: "pause" as const } : retryPolicy(own.retryPolicy),
         enableLazyState: stateful ? own.enableLazyState : undefined,
-        input: serde(handler.input),
-        output: serde(handler.success)
+        input: cachedSerde(handler.input),
+        output: cachedSerde(handler.success)
       })
       handlers[method] = contract.kind === "service"
         ? sdk.handlers.handler(options, execute)
@@ -75,10 +83,9 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
     return sdk.workflow({ ...definition, handlers: handlers as { run: (ctx: sdk.WorkflowContext, input: any) => Promise<any> } })
 }
 
-/** Anything but a single declared failure (or a client error): a bug, an interruption, several failures. */
-const isDefect = (cause: Cause.Cause<unknown>) => !(cause.reasons.length === 1 && Cause.isFailReason(cause.reasons[0]))
-
-const millis = (duration: Duration.Input | undefined) => duration === undefined ? undefined : Duration.toMillis(duration)
+/** The span in Restate's trace context for this attempt, if it sent one: the handler span continues it. */
+const parentSpan = (request: sdk.Request) =>
+  Option.getOrUndefined(HttpTraceContext.fromHeaders(Headers.fromInput(Object.fromEntries(request.attemptHeaders ?? []))))
 
 const retryPolicy = (policy: RetryPolicy | undefined) => policy && defined({
   maxAttempts: policy.maxAttempts,

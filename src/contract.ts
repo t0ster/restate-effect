@@ -1,10 +1,9 @@
 import { Context, Effect, Layer, Schema } from "effect"
-import { Endpoint, definition } from "./server.js"
+import { Endpoint, definition, type InvocationServices } from "./server.js"
 import type { Duration, Scope } from "effect"
 import type { ClientError } from "./errors.js"
 import type { Codec } from "./codec.js"
-import type { Invocation, Keyed, StateReader, StateWriter } from "./invocation.js"
-import type { Transport } from "./client.js"
+import type { Keyed, StateReader, StateWriter } from "./invocation.js"
 
 export type Kind = "service" | "object" | "workflow"
 export type Mode = "default" | "shared"
@@ -75,7 +74,7 @@ export type Implementations<H extends Handlers> = {
   readonly [K in keyof H]: (input: H[K]["input"]["Type"]) => Effect.Effect<H[K]["success"]["Type"], H[K]["error"]["Type"] | ClientError, any>
 }
 type Requirements<F> = F extends (...args: any[]) => Effect.Effect<any, any, infer R> ? R : never
-type Provided = Invocation | Transport | Scope.Scope | StateReader | StateWriter | Keyed
+type Provided = InvocationServices | Scope.Scope
 type CheckCapabilities<H extends Handlers, K extends Kind, F extends Implementations<H>> = {
   [M in keyof H]: Extract<Requirements<F[M]>, K extends "service" ? StateReader | StateWriter | Keyed : H[M]["mode"] extends "shared" ? StateWriter : never> extends never
     ? unknown : never

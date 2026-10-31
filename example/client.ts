@@ -2,10 +2,12 @@ import { Cause, Effect, Layer } from "effect"
 import { Restate } from "@t0ster/restate-effect"
 import { AlbumService, Gallery, Profile, Signup } from "./app.ts"
 
+const signups = Restate.client(Signup)
+
 const signup = (name: string, email: string) => Effect.gen(function* () {
   // A workflow's `run` starts it and waits. One run per key: running "ada" again joins it.
-  const messageId = yield* Restate.client(Signup).key(name).run({ email })
-  console.log(`${name}: welcomed (${messageId}), status: ${yield* Restate.client(Signup).key(name).status()}`)
+  const messageId = yield* signups.key(name).run({ email })
+  console.log(`${name}: welcomed (${messageId}), status: ${yield* signups.key(name).status()}`)
 }).pipe(
   // Declared errors arrive as their own classes.
   Effect.catchTags({
