@@ -72,11 +72,12 @@ Define typed contracts for Restate services, virtual objects and workflows with 
 
 Use `Restate.client(contract).key(id)` to call an object or workflow. Inside their handlers, `Restate.key` gives the key and `Restate.state` reads and writes state.
 
-Handler dependencies become requirements of the implementation Layer, provided once at startup. Server options such as `retryPolicy` and `onDefect` go on `toLayer`.
+Handler dependencies become requirements of the implementation Layer, provided once at startup. Server options such as `retryPolicy`, `runRetry` and `onDefect` go on `toLayer`, for the service or per handler.
 
 ## Durability and errors
 
 - **External I/O belongs in `Restate.run(name, effect, { success, error })`.** Restate stores the result and reuses it on replay. Don't call Restate operations inside the step.
+- **Set a default step retry with `runRetry`.** `toLayer(handlers, { runRetry: { maxAttempts: 3, initialInterval: "2 seconds" } })` applies to every `Restate.run` in the Layer's handlers; set it per handler under `handlers: { name: { runRetry } }`. A step's own `retry` overrides the fields it sets, and `retry.while` (which declared errors to retry) is per step only. When a step's retries run out on a defect, the handler fails with a defect: with `onDefect: "fail"`, the invocation fails and `Restate.onError` runs.
 - **External writes still need idempotency keys.** A crash before a step's result is stored can cause it to run again.
 - Use `Restate.now` and `Restate.sleep` for replay-safe time. Ordinary clocks, randomness and I/O outside `run` are not replay-safe.
 - Use `Restate.all`, `Restate.raceAll` and `Restate.fork` for durable concurrency. Ordinary Effect concurrency over durable operations is rejected at runtime.

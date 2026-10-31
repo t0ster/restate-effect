@@ -1,5 +1,5 @@
 export { handler, shared, service, object, workflow } from "./contract.js"
-export type { Contract, Handler, InterfaceOptions, HandlerServerOptions, ServerOptions, RetryPolicy } from "./contract.js"
+export type { Contract, Handler, InterfaceOptions, HandlerServerOptions, ServerOptions, RetryPolicy, RunRetryPolicy } from "./contract.js"
 export { client, makeClient, Client, InvocationId, Transport, ingressTransport, layerIngress } from "./client.js"
 export { ClientError } from "./errors.js"
 export type { Call, CallOptions, Method, SendOptions } from "./client.js"

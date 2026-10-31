@@ -22,6 +22,10 @@ const program = Effect.gen(function* () {
   yield* signup("admin", "admin@example.com")
   yield* signup("mallory", "blocked@example.com")
   yield* signup(" ", "nobody@example.com").pipe(Effect.catchCause(cause => Effect.sync(() => console.log("bug:", Cause.pretty(cause)))))
+  // An outage outlasting the step's retries: the signup fails, and its onError cleanup ran.
+  yield* signup("offline", "offline@example.com").pipe(Effect.catchCause(() => Effect.gen(function* () {
+    console.log(`offline: ${yield* signups.key("offline").status()}`)
+  })))
 
   // Photos: many at once, nested groups, and a one-way call.
   const names = ["cat.jpg", "dog.bad", "sun.jpg"]

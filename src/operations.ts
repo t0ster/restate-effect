@@ -8,7 +8,8 @@ import { millis } from "./duration.js"
 import { Durable, awaitPromise, decodeRejection, isCancellation, isFinal } from "./durable.js"
 import { ClientError } from "./errors.js"
 import { Invocation, Keyed, StateReader, StateWriter } from "./invocation.js"
-import { omitInvocationServices, type InvocationServices } from "./server.js"
+import { defined, omitInvocationServices, type InvocationServices } from "./server.js"
+import type { RunRetryPolicy } from "./contract.js"
 
 /** A durable timer: survives restarts and replays. Cancellation interrupts it. */
 export const sleep = (duration: Duration.Input): Durable<void, never, Invocation> =>
@@ -37,15 +38,13 @@ export const onError: {
 } = dual(2, <A, E, R, X, R2>(self: Effect.Effect<A, E, R>, cleanup: (cause: Cause.Cause<E>) => Effect.Effect<X, never, R2>) =>
   Effect.onError(self, cause => Effect.flatMap(Invocation, invocation => isFinal(invocation, cause) ? Effect.asVoid(cleanup(cause)) : Effect.void)))
 
-/** How `Restate.run` retries: declared failures matching `while`, and every defect. */
-export interface RunRetry<E> {
+/**
+ * How `Restate.run` retries: declared failures matching `while`, and every defect. Fields left out
+ * come from the handler's `runRetry` server option.
+ */
+export interface RunRetry<E> extends RunRetryPolicy {
   /** Retry this declared failure; others are final at once. Defects are always retried. */
   readonly while?: (error: E) => boolean
-  readonly maxAttempts?: number
-  readonly initialInterval?: Duration.Input
-  readonly maxInterval?: Duration.Input
-  readonly exponentiationFactor?: number
-  readonly maxDuration?: Duration.Input
 }
 
 /**
@@ -59,8 +58,8 @@ export function run<A extends Codec, E extends Codec, R>(
   action: Effect.Effect<A["Type"], E["Type"], R> & (Extract<R, InvocationServices> extends never ? unknown : never),
   options: { readonly success: A; readonly error: E; readonly retry?: RunRetry<E["Type"]> }
 ): Durable<A["Type"], E["Type"], R | Invocation> {
-  const retry = options.retry
   return new Durable((invocation, context) => {
+    const retry: RunRetry<E["Type"]> = { ...invocation.runRetry, ...defined(options.retry ?? {}) }
     // The public signature excludes these services from R; also remove them at runtime.
     const isolated = omitInvocationServices(context as Context.Context<any>) as Context.Context<R>
     const step = invocation.ctx.run(name, async () => {
@@ -68,15 +67,15 @@ export function run<A extends Codec, E extends Codec, R>(
         signal: invocation.ctx.request().attemptCompletedSignal
       })
       const declared = Exit.isFailure(exit) ? singleFailure(exit.cause) : undefined
-      if (declared && retry?.while?.(declared.error)) throw retryableFailure(declared.error, options.error)
+      if (declared && retry.while?.(declared.error)) throw retryableFailure(declared.error, options.error)
       return unwrapExit(exit, options.error)
     }, {
       serde: cachedSerde(options.success),
-      maxRetryAttempts: retry?.maxAttempts,
-      initialRetryInterval: millis(retry?.initialInterval),
-      maxRetryInterval: millis(retry?.maxInterval),
-      retryIntervalFactor: retry?.exponentiationFactor,
-      maxRetryDuration: millis(retry?.maxDuration)
+      maxRetryAttempts: retry.maxAttempts,
+      initialRetryInterval: millis(retry.initialInterval),
+      maxRetryInterval: millis(retry.maxInterval),
+      retryIntervalFactor: retry.exponentiationFactor,
+      maxRetryDuration: millis(retry.maxDuration)
     })
     // Exhausted retries of a declared failure carry it in the message; of a defect, still a defect.
     return decodeRejection(step, failure => decodeFailure(failure, options.error) ?? exhaustedFailure(failure, options.error))

@@ -1,5 +1,6 @@
 import { Context } from "effect"
 import type * as sdk from "@restatedev/restate-sdk"
+import type { RunRetryPolicy } from "./contract.js"
 
 export interface InvocationState {
   readonly ctx: sdk.Context
@@ -7,6 +8,8 @@ export interface InvocationState {
   readonly stateful: boolean
   /** What a defect in this handler does; decides whether `Restate.onError` runs for one. */
   readonly onDefect: "pause" | "fail"
+  /** The handler's default `Restate.run` retry. */
+  readonly runRetry: RunRetryPolicy
   readonly assertReady: () => void
   /** Runs one awaited durable operation; rejects a second one while the first is pending. */
   readonly execute: <A>(operation: () => PromiseLike<A>) => Promise<A>
@@ -20,14 +23,14 @@ export class StateReader extends Context.Service<StateReader, InvocationState>()
 /** Provided to exclusive object handlers and workflow `run`: they can write state. */
 export class StateWriter extends Context.Service<StateWriter, InvocationState>()("restate-effect/StateWriter") {}
 
-export function invocationState(ctx: sdk.Context, stateful: boolean, writable: boolean, onDefect: "pause" | "fail"): InvocationState {
+export function invocationState(ctx: sdk.Context, stateful: boolean, writable: boolean, onDefect: "pause" | "fail", runRetry: RunRetryPolicy): InvocationState {
   let pending = false
   const assertReady = () => {
     if (ctx.request().attemptCompletedSignal.aborted) throw new Error("Restate attempt has ended")
     if (pending) throw new Error("Concurrent durable operations are unsupported outside Restate combinators: sequence them with yield*, or use Restate.all, Restate.fork or Restate.raceAll. Use concurrency inside Restate.run for external I/O.")
   }
   return {
-    ctx, stateful, writable, onDefect, assertReady,
+    ctx, stateful, writable, onDefect, runRetry, assertReady,
     async execute(operation) {
       assertReady()
       pending = true

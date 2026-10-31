@@ -47,6 +47,14 @@ export interface RetryPolicy {
   readonly maxInterval?: Duration.Input
   readonly exponentiationFactor?: number
 }
+/** How `Restate.run` retries a step: each field a step's own `retry` sets overrides this. No `while`: that stays per step. */
+export interface RunRetryPolicy {
+  readonly maxAttempts?: number
+  readonly initialInterval?: Duration.Input
+  readonly maxInterval?: Duration.Input
+  readonly exponentiationFactor?: number
+  readonly maxDuration?: Duration.Input
+}
 /** How this server runs a handler: passed to `toLayer`, not part of the shared contract. */
 export interface HandlerServerOptions {
   /**
@@ -56,6 +64,11 @@ export interface HandlerServerOptions {
    */
   readonly onDefect?: "pause" | "fail"
   readonly retryPolicy?: RetryPolicy
+  /**
+   * The default retry of every `Restate.run` in the handler; a handler's fields override the
+   * service's. Exhausted retries of a defect are a defect of the handler (see `onDefect`).
+   */
+  readonly runRetry?: RunRetryPolicy
   readonly journalRetention?: Duration.Input
   readonly idempotencyRetention?: Duration.Input
   readonly inactivityTimeout?: Duration.Input

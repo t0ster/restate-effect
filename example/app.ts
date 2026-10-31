@@ -187,7 +187,8 @@ export const ProfileLive = Profile.toLayer({
 // ── Signup: external side effects, retries, errors and cleanup ──
 //
 // External I/O goes in `Restate.run`: its result is journaled, so a replay does not repeat it.
-// Inside `run`, defects are retried, and so are declared errors matching `retry.while`.
+// Inside `run`, defects are retried, and so are declared errors matching `retry.while`; the
+// `runRetry` option sets how often for every step, and a step's own `retry` overrides it.
 
 export const SignupLive = Signup.toLayer({
   run: ({ email }) => Effect.gen(function* () {
@@ -200,7 +201,8 @@ export const SignupLive = Signup.toLayer({
     const register = store.insert(name).pipe(
       // Translate internal errors at the boundary: the one a caller can act on becomes declared...
       Effect.catchTag("UniqueViolation", () => Effect.fail(new NameTaken({ name }))),
-      // ...the rest is a defect, which run retries: an outage is temporary.
+      // ...the rest is a defect, which run retries: an outage is usually temporary. When retries
+      // run out, it is a defect of the signup, which then fails (onDefect below).
       Effect.catchTag("ConnectionLost", Effect.die)
     )
     yield* Restate.run("register", register, { success: Schema.Void, error: NameTaken })
@@ -211,8 +213,9 @@ export const SignupLive = Signup.toLayer({
     const messageId = yield* Restate.run("welcome-mail", mailer.send(email, `Welcome, ${name}!`), {
       success: Schema.String,
       error: Schema.Union([MailRejected, MailUnavailable]),
-      // Retry MailUnavailable; MailRejected, or the last MailUnavailable, fails the signup.
-      retry: { while: error => error._tag === "MailUnavailable", maxAttempts: 3, initialInterval: "1 second" }
+      // Retry MailUnavailable, as runRetry below says; MailRejected, or the last MailUnavailable,
+      // fails the signup.
+      retry: { while: error => error._tag === "MailUnavailable" }
     })
 
     const welcomedAt = yield* Restate.now   // journaled: a replay sees the same time
@@ -228,7 +231,7 @@ export const SignupLive = Signup.toLayer({
       yield* Restate.run("alert-ops", mailer.send("ops@example.com", "A signup failed"), {
         success: Schema.String,
         error: Schema.Union([MailRejected, MailUnavailable]),
-        retry: { while: error => error._tag === "MailUnavailable", maxAttempts: 3, initialInterval: "1 second" }
+        retry: { while: error => error._tag === "MailUnavailable" }
       })
     }).pipe(
       // Cleanup cannot fail with a typed error: if it fails, it is a defect.
@@ -239,7 +242,9 @@ export const SignupLive = Signup.toLayer({
 }, {
   // A defect ends a signup at once: callers get an opaque internal error instead of waiting.
   // The default, "pause", retries and then pauses the invocation for an operator to resume.
-  onDefect: "fail"
+  onDefect: "fail",
+  // Every Restate.run in Signup: 3 attempts, 1 second apart at first.
+  runRetry: { maxAttempts: 3, initialInterval: "1 second" }
 })
 
 // ── Album: react to each result as it arrives ──
@@ -329,7 +334,9 @@ export class UserStore extends Context.Service<UserStore, {
 }>()("example/UserStore") {}
 const takenNames = new Set(["admin"])
 const DemoUserStore = Layer.succeed(UserStore)({
-  insert: name => takenNames.has(name) ? Effect.fail(new UniqueViolation()) : Effect.sync(() => { takenNames.add(name) })
+  // "offline" stands for a database that stays down.
+  insert: name => name === "offline" ? Effect.fail(new ConnectionLost())
+    : takenNames.has(name) ? Effect.fail(new UniqueViolation()) : Effect.sync(() => { takenNames.add(name) })
 })
 
 export class Mailer extends Context.Service<Mailer, {

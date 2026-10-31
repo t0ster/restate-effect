@@ -83,6 +83,7 @@ for (const [runtime, port] of [["node", 29180], ["bun", 29181]] as const) {
         /Name taken: admin/,                   // declared errors arrive typed
         /mail rejected: blocked@example\.com/,
         /bug: RestateClientError: Signup\/run failed/, // a defect stays opaque
+        /offline: failed/,                     // runRetry exhausted: the signup fails, onError ran
         /not published: dog\.bad/,             // nested durable concurrency
         /album: \{/,                           // one-way start, then attach by invocation ID
         /ada's albums: \[ ["']album-\d+/            // console.log quotes differ: Node ', Bun "

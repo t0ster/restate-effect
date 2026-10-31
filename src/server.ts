@@ -24,8 +24,9 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
     for (const [method, handler] of Object.entries(contract.handlers)) {
       const own: HandlerServerOptions = (overrides as Record<string, HandlerServerOptions | undefined>)[method] ?? {}
       const onDefect = own.onDefect ?? shared.onDefect ?? "pause"
+      const runRetry = { ...shared.runRetry, ...defined(own.runRetry ?? {}) }
       const execute = async (ctx: sdk.Context, input: unknown) => {
-        const invocation = invocationState(ctx, stateful, stateful && handler.mode !== "shared", onDefect)
+        const invocation = invocationState(ctx, stateful, stateful && handler.mode !== "shared", onDefect, runRetry)
         let context = Context.add(
           Context.add(services, Invocation, invocation),
           Transport, invocationTransport(ctx, invocation.execute)
@@ -105,7 +106,7 @@ const sdkOptions = (options: HandlerServerOptions) => ({
 })
 
 /** Drops undefined fields, so they do not override defaults set elsewhere. */
-function defined<T extends object>(value: T): T {
+export function defined<T extends object>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as T
 }
 
