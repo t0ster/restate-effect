@@ -1,0 +1,100 @@
+import { Cause, Exit, Schema } from "effect"
+import * as sdk from "@restatedev/restate-sdk"
+import { HttpCallError } from "@restatedev/restate-sdk-clients"
+import { ClientError } from "./errors.js"
+
+/** Restate serdes are synchronous; schemas requiring services are unsupported. */
+export type Codec = Schema.ConstraintCodec<any, any, never, never>
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
+/** TerminalError metadata key holding the encoded declared failure. */
+const errorKey = "effectError"
+
+export function serde<S extends Codec>(schema: S): sdk.Serde<S["Type"]> {
+  const json = Schema.toCodecJson(schema)
+  const encode = Schema.encodeSync(json)
+  const decode = Schema.decodeUnknownSync(json)
+  return {
+    contentType: "application/json",
+    jsonSchema: jsonSchema(schema),
+    serialize(value) {
+      const encoded = encode(value)
+      return encoded === undefined ? new Uint8Array() : encoder.encode(JSON.stringify(encoded))
+    },
+    deserialize(bytes) {
+      return decode(bytes.length === 0 ? undefined : JSON.parse(decoder.decode(bytes)))
+    }
+  }
+}
+
+/** The schema's JSON form as JSON Schema, which Restate shows in its UI and OpenAPI; undefined if it has none. */
+function jsonSchema(schema: Codec): object | undefined {
+  try {
+    const document = Schema.toJsonSchemaDocument(schema)
+    return Object.keys(document.definitions).length > 0 ? { ...document.schema, $defs: document.definitions } : document.schema
+  } catch {
+    return undefined
+  }
+}
+
+/** Domain failures are terminal. Defects and interruption are never encoded as domain errors. */
+export function unwrapExit<A, E>(exit: Exit.Exit<A, E>, error: Codec): A {
+  if (Exit.isSuccess(exit)) return exit.value
+  const reasons = exit.cause.reasons
+  if (reasons.length === 1 && Cause.isFailReason(reasons[0])) {
+    if (reasons[0].error instanceof ClientError) {
+      const cause = reasons[0].error.cause
+      if (cause instanceof Error) throw cause
+      throw new Error("Restate operation failed", { cause })
+    }
+    throw declaredTerminalError(reasons[0].error, error)
+  }
+  const cause = Cause.squash(exit.cause)
+  // A defect containing TerminalError must not silently become a terminal domain failure.
+  if (cause instanceof Error && !(cause instanceof sdk.TerminalError)) throw cause
+  throw new Error("Effect handler failed", { cause })
+}
+
+/** The error's own message, else its tag: a Schema.Error without a message has an empty one. */
+function failureMessage(failure: unknown): string {
+  if (failure instanceof Error && failure.message) return failure.message
+  const tag = (failure as { readonly _tag?: unknown } | null)?._tag
+  return typeof tag === "string" ? tag : "Restate handler failed"
+}
+
+/** A TerminalError's metadata, or the metadata in an ingress error body; undefined for other errors. */
+function failureMetadata(error: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (error instanceof sdk.TerminalError) return error.metadata
+  if (!(error instanceof HttpCallError)) return undefined
+  let body: unknown
+  try { body = JSON.parse(error.responseText) } catch { return undefined }
+  if (typeof body !== "object" || body === null || !("metadata" in body)) return undefined
+  return typeof body.metadata === "object" && body.metadata !== null ? body.metadata as Record<string, unknown> : undefined
+}
+
+/** The declared failure a Restate error carries; undefined when it carries none. Throws when it does not decode. */
+export function decodeFailure(error: unknown, schema: Codec): { readonly value: unknown } | undefined {
+  const encoded = failureMetadata(error)?.[errorKey]
+  if (encoded === undefined) return undefined
+  if (typeof encoded !== "string") throw new Error("Invalid declared failure metadata")
+  return { value: Schema.decodeUnknownSync(Schema.toCodecJson(schema))(JSON.parse(encoded)) }
+}
+
+/**
+ * A declared failure that `Restate.run` retries: Restate keeps only a retryable error's message,
+ * so the encoded failure travels in it, and is restored once retries are exhausted.
+ */
+const retryablePrefix = "restate-effect/retryable:"
+export function retryableFailure(failure: unknown, error: Codec): Error {
+  return new Error(retryablePrefix + JSON.stringify(Schema.encodeSync(Schema.toCodecJson(error))(failure)))
+}
+/** The declared failure a terminal error from exhausted `Restate.run` retries carries, if any. */
+export function exhaustedFailure(error: sdk.TerminalError, schema: Codec): { readonly value: unknown } | undefined {
+  if (!error.message.startsWith(retryablePrefix)) return undefined
+  return { value: Schema.decodeUnknownSync(Schema.toCodecJson(schema))(JSON.parse(error.message.slice(retryablePrefix.length))) }
+}
+/** A declared failure as a TerminalError: a readable message for people, the encoded error for decoding. */
+export function declaredTerminalError(failure: unknown, error: Codec): sdk.TerminalError {
+  const encoded = JSON.stringify(Schema.encodeSync(Schema.toCodecJson(error))(failure))
+  return new sdk.TerminalError(failureMessage(failure), { metadata: { [errorKey]: encoded } })
+}

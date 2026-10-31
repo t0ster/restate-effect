@@ -1,0 +1,22 @@
+name: Publish
+on:
+  push:
+    tags: ["v*"]
+
+# npm trusted publishing: no token; npm verifies this workflow and adds provenance.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - run: npm publish

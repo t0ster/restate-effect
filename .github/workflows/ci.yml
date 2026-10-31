@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      # Node 24 runs the example's TypeScript directly (type stripping).
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run lint
+      # Builds, then serves the example on Node and on Bun against restatedev/restate in Docker.
+      - run: bun run test:e2e

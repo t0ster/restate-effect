@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "rewriteRelativeImportExtensions": true,
+    "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "types": ["node"], "skipLibCheck": true, "declaration": true,
+    "outDir": "dist", "verbatimModuleSyntax": true,
+    "paths": { "@t0ster/restate-effect": ["./src/index.ts"] }
+  },
+  "include": ["src", "example", "test"]
+}

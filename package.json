@@ -1,0 +1,48 @@
+{
+  "name": "@t0ster/restate-effect",
+  "version": "0.1.0",
+  "description": "Restate services for Effect: handlers are Effects, errors are typed across the wire, durable operations compose like Effects",
+  "license": "MIT",
+  "author": "Roman Dolgyi <tosters@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/t0ster/restate-effect.git"
+  },
+  "homepage": "https://github.com/t0ster/restate-effect#readme",
+  "bugs": "https://github.com/t0ster/restate-effect/issues",
+  "keywords": ["restate", "effect", "durable-execution", "workflows", "typescript"],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "lint": "oxlint --type-aware --deny-warnings",
+    "test:e2e": "bun run build && bun test --timeout 300000 test/e2e.test.ts",
+    "prepublishOnly": "bun run check && bun run lint && bun run build"
+  },
+  "peerDependencies": {
+    "effect": "^4.1.0",
+    "@restatedev/restate-sdk": "^1.18.0",
+    "@restatedev/restate-sdk-clients": "^1.18.0"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "4.1.0",
+    "@restatedev/restate-sdk": "1.18.0",
+    "@restatedev/restate-sdk-clients": "1.18.0",
+    "@types/node": "^26",
+    "effect": "4.1.0",
+    "oxlint": "^1.90.0",
+    "oxlint-tsgolint": "^7.0.2005",
+    "typescript": "7.0.2"
+  }
+}
