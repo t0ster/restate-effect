@@ -38,6 +38,14 @@ const waitFor = async (what: string, ready: () => Promise<boolean>, seconds = 60
 }
 
 const container = `restate-effect-e2e-${process.pid}`
+/** A JSON call through Restate ingress. */
+const call = async (path: string, body: unknown) => {
+  const response = await fetch(`${ingress}/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+  assert.ok(response.ok, `${path}: ${response.status} ${await response.clone().text()}`)
+  return response.json() as Promise<unknown>
+}
+const albumsOf = async (owner: string) => await call(`Profile/${owner}/albums`, null) as ReadonlyArray<string>
+
 let restate: ReturnType<typeof start>
 
 before(async () => {
@@ -79,6 +87,18 @@ for (const [runtime, port] of [["node", 29180], ["bun", 29181]] as const) {
         /album: \{/,                           // one-way start, then attach by invocation ID
         /ada's albums: \[ ["']album-\d+/            // console.log quotes differ: Node ', Bun "
       ]) assert.match(output, line)
+
+      // Cancellation: an album with a RAW photo is still developing it when cancelled. Its
+      // Restate.onError compensation (durable) takes the album off the profile before it ends.
+      const albumId = `album-cancelled-on-${runtime}`
+      const id = await call("Albums/create", { albumId, owner: "ada", photos: ["night.raw"] }) as string
+      await waitFor("the album to start", async () => (await albumsOf("ada")).includes(albumId), 30)
+      const cancel = await fetch(`${admin}/invocations/${id}/cancel`, { method: "PATCH" })
+      assert.equal(cancel.status, 202, await cancel.text())
+      const attached = await fetch(`${ingress}/restate/invocation/${id}/attach`)
+      assert.equal(attached.status, 409)
+      assert.equal((await attached.json() as { message: string }).message, "Cancelled")
+      assert.ok(!(await albumsOf("ada")).includes(albumId), "onError removed the cancelled album")
     } finally {
       await stop(server)
     }

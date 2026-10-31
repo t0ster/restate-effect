@@ -118,7 +118,8 @@ const album = Restate.client(Album)
 export const PhotosLive = Photos.toLayer({
   upload: photo => photo.endsWith(".bad")
     ? Effect.fail(new UploadFailed({ photo }))
-    : Effect.succeed(`https://cdn.example/${photo}`),
+    // RAW photos take a minute to develop: a durable timer, so a restart does not start it over.
+    : Effect.as(photo.endsWith(".raw") ? Restate.sleep("1 minute") : Effect.void, `https://cdn.example/${photo}`),
   thumbnail: url => Effect.succeed(`${url}?width=200`)
 }, {
   // Photos may be private: Restate keeps no journal once an invocation completes.
@@ -267,7 +268,11 @@ export const AlbumLive = Album.toLayer({
       yield* Restate.state.set("progress", PublishReport, { thumbnails, failed })
     }
     return { thumbnails, failed }
-  }),
+  }).pipe(
+    // Cancelled (or failed for good): take the album off its owner's profile again. Only on the
+    // final failure, never when an attempt merely ends, and the cleanup itself is durable.
+    Restate.onError(() => Effect.flatMap(Restate.key, albumId => profile.key(owner).forgetAlbum(albumId)).pipe(Effect.orDie))
+  ),
   progress: () => Effect.map(
     Restate.state.get("progress", PublishReport),
     report => report ?? { thumbnails: [], failed: [] }
