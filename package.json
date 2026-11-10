@@ -1,6 +1,6 @@
 {
   "name": "@t0ster/restate-effect",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Restate services for Effect: handlers are Effects, errors are typed across the wire, durable operations compose like Effects",
   "license": "MIT",
   "author": "Roman Dolgyi <tosters@gmail.com>",
@@ -10,7 +10,13 @@
   },
   "homepage": "https://github.com/t0ster/restate-effect#readme",
   "bugs": "https://github.com/t0ster/restate-effect/issues",
-  "keywords": ["restate", "effect", "durable-execution", "workflows", "typescript"],
+  "keywords": [
+    "restate",
+    "effect",
+    "durable-execution",
+    "workflows",
+    "typescript"
+  ],
   "type": "module",
   "sideEffects": false,
   "exports": {
@@ -19,7 +25,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
