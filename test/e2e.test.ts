@@ -45,6 +45,15 @@ const call = async (path: string, body: unknown) => {
   return response.json() as Promise<unknown>
 }
 const albumsOf = async (owner: string) => await call(`Profile/${owner}/albums`, null) as ReadonlyArray<string>
+/** Registers the endpoint on this port with Restate. */
+const register = async (port: number) => {
+  const registration = await fetch(`${admin}/deployments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uri: `http://127.0.0.1:${port}`, force: true })
+  })
+  assert.equal(registration.status, 201, await registration.text())
+}
 
 let restate: ReturnType<typeof start>
 
@@ -67,12 +76,7 @@ for (const [runtime, port] of [["node", 29180], ["bun", 29181]] as const) {
     const server = start(runtime, ["example/server.ts"], { PORT: String(port) })
     try {
       await waitFor(`the ${runtime} endpoint`, async () => server.output().includes("Listening on"), 30)
-      const registration = await fetch(`${admin}/deployments`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ uri: `http://127.0.0.1:${port}`, force: true })
-      })
-      assert.equal(registration.status, 201, await registration.text())
+      await register(port)
 
       const client = start(runtime, ["example/client.ts"], { RESTATE_INGRESS_URL: ingress })
       const code = await client.exited
@@ -105,3 +109,44 @@ for (const [runtime, port] of [["node", 29180], ["bun", 29181]] as const) {
     }
   })
 }
+
+// Restate.run retry.delay: a declared failure sets the wait before the next attempt (fixture: test/retries.ts).
+void test("a retried failure's delay overrides the backoff", { timeout: 120_000 }, async () => {
+  const port = 29182
+  const server = start("node", ["test/retries.ts"], { PORT: String(port) })
+  try {
+    await waitFor("the retries endpoint", async () => server.output().includes("Listening on"), 30)
+    await register(port)
+    const attempts = async (id: string) => {
+      const started = await call("Retries/attempts", id) as ReadonlyArray<number>
+      return started.slice(1).map((time, i) => time - started[i]!)
+    }
+    const backoff = 2000   // the fixture's runRetry: initialInterval "2 seconds", factor 1
+
+    // Delays of 300ms, then none (the backoff): the third attempt succeeds.
+    assert.equal(await call("Retries/call", { id: "delay-then-backoff", retryAfter: [300, null], maxAttempts: 5 }), 3)
+    const [delayed, backedOff] = await attempts("delay-then-backoff")
+    assert.ok(delayed! >= 300 && delayed! < backoff, `delayed retry after ${delayed}ms`)
+    assert.ok(backedOff! >= backoff, `backoff retry after ${backedOff}ms`)
+    assert.match(server.output(), /Restate\.run 'call' failed; retrying in 300ms/)   // the SDK logs only backoff retries
+
+    // maxAttempts still bounds delayed retries; the last failure is returned as the declared error.
+    const response = await fetch(`${ingress}/Retries/call`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "exhausted", retryAfter: [100, 100, 100, 100, 100], maxAttempts: 3 })
+    })
+    const body = await response.json() as { message: string; metadata?: { effectError?: string } }
+    assert.equal(response.ok, false)
+    assert.equal(body.message, "RateLimited", `${JSON.stringify(body)}\n--- endpoint:\n${server.output()}`)
+    const failure = JSON.parse(body.metadata!.effectError!) as { _tag: string; attempt: number; retryAfter: unknown }
+    assert.equal(failure._tag, "RateLimited")
+    assert.equal(failure.attempt, 3)
+    assert.ok(failure.retryAfter !== undefined, "the failure keeps its retryAfter")
+    const gaps = await attempts("exhausted")
+    assert.equal(gaps.length, 2, "three attempts")
+    for (const gap of gaps) assert.ok(gap >= 100 && gap < backoff, `delayed retry after ${gap}ms`)
+  } finally {
+    await stop(server)
+  }
+})

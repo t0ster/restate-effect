@@ -40,18 +40,30 @@ export const onError: {
 
 /**
  * How `Restate.run` retries: declared failures matching `while`, and every defect. Fields left out
- * come from the handler's `runRetry` server option.
+ * come from the handler's `runRetry` server option; `while` and `delay` are per step only.
  */
 export interface RunRetry<E> extends RunRetryPolicy {
   /** Retry this declared failure; others are final at once. Defects are always retried. */
   readonly while?: (error: E) => boolean
+  /**
+   * How long to wait before the next attempt after this retried declared failure, such as a rate
+   * limit's Retry-After; undefined (or an infinite duration) uses the backoff of `initialInterval`,
+   * `exponentiationFactor` and `maxInterval`. Restate adds no jitter to it: add your own here. It
+   * runs inside the failed attempt and only tells Restate when to retry, so it may be random.
+   * `maxAttempts` and `maxDuration` still bound the retries; `maxDuration` is checked when an
+   * attempt fails, so a delay can start the next attempt after it. Without either, a delay of 0
+   * retries at once, forever: bound delayed retries. If `delay` (or `while`) throws, the step
+   * retries as a defect and ends as one, not as the declared failure.
+   */
+  readonly delay?: (error: E) => Duration.Input | undefined
 }
 
 /**
  * Runs external I/O as one journaled step: a replay returns the journaled result instead of
  * running it again. Defects are retried, and die once retries are exhausted; declared failures are
- * final unless `retry.while` matches, and once retries are exhausted the last one is returned. The action must not depend on Restate
- * operations or durable clients.
+ * final unless `retry.while` matches, and once retries are exhausted the last one is returned;
+ * `retry.delay` can set the wait before the next attempt from the failure. The action must not
+ * depend on Restate operations or durable clients.
  */
 export function run<A extends Codec, E extends Codec, R>(
   name: string,
@@ -67,7 +79,14 @@ export function run<A extends Codec, E extends Codec, R>(
         signal: invocation.ctx.request().attemptCompletedSignal
       })
       const declared = Exit.isFailure(exit) ? singleFailure(exit.cause) : undefined
-      if (declared && retry.while?.(declared.error)) throw retryableFailure(declared.error, options.error)
+      if (declared && retry.while?.(declared.error)) {
+        const retryAfter = retryDelay(retry.delay?.(declared.error))
+        // The SDK logs a retried step only when it uses the backoff: log a delayed retry here.
+        if (retryAfter !== undefined) {
+          Effect.runSyncWith(isolated)(Effect.logWarning(`Restate.run '${name}' failed; retrying in ${retryAfter}ms`, declared.error))
+        }
+        throw retryableFailure(declared.error, options.error, retryAfter)
+      }
       return unwrapExit(exit, options.error)
     }, {
       serde: cachedSerde(options.success),
@@ -80,6 +99,12 @@ export function run<A extends Codec, E extends Codec, R>(
     // Exhausted retries of a declared failure carry it in the message; of a defect, still a defect.
     return decodeRejection(step, failure => decodeFailure(failure, options.error) ?? exhaustedFailure(failure, options.error))
   })
+}
+
+/** A step's retry delay in whole milliseconds, as Restate takes it; undefined when infinite, so the backoff applies. */
+const retryDelay = (delay: Duration.Input | undefined): number | undefined => {
+  const millis = delay === undefined ? undefined : Duration.toMillis(delay)
+  return millis === undefined || !Number.isFinite(millis) ? undefined : Math.max(0, Math.ceil(millis))
 }
 
 /** A state write: only exclusive object handlers and workflow `run` can write. */

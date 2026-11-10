@@ -47,7 +47,7 @@ export interface RetryPolicy {
   readonly maxInterval?: Duration.Input
   readonly exponentiationFactor?: number
 }
-/** How `Restate.run` retries a step: each field a step's own `retry` sets overrides this. No `while`: that stays per step. */
+/** How `Restate.run` retries a step: each field a step's own `retry` sets overrides this. No `while` or `delay`: those stay per step. */
 export interface RunRetryPolicy {
   readonly maxAttempts?: number
   readonly initialInterval?: Duration.Input

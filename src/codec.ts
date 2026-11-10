@@ -103,9 +103,12 @@ const retryablePrefix = "restate-effect/retryable:"
 /**
  * A declared failure that `Restate.run` retries: Restate keeps only a retryable error's message,
  * so the encoded failure travels in it, and is restored once retries are exhausted.
+ * With `retryAfter` (milliseconds), Restate waits that long before the next attempt instead of
+ * the step's backoff.
  */
-export function retryableFailure(failure: unknown, error: Codec): Error {
-  return new Error(retryablePrefix + encodeDeclared(failure, error))
+export function retryableFailure(failure: unknown, error: Codec, retryAfter?: number): Error {
+  const message = retryablePrefix + encodeDeclared(failure, error)
+  return retryAfter === undefined ? new Error(message) : new sdk.RetryableError(message, { retryAfter })
 }
 /** The declared failure a terminal error from exhausted `Restate.run` retries carries, if any. */
 export function exhaustedFailure(error: sdk.TerminalError, schema: Codec): { readonly value: unknown } | undefined {
