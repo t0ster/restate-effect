@@ -90,10 +90,16 @@ The [example](example/app.ts) shows these patterns, including step retries, dela
 
 ## Concurrency limits
 
-`Restate.Semaphore` caps how many invocations do something at once, across every handler and process, such as calls to an API that allows four in flight:
+`Restate.Semaphore` caps how many invocations do something at once, across every handler and process, such as calls to an API that allows four in flight. Its permits live in a virtual object that your app names and registers, like any other service:
 
 ```ts
-const gateway = Restate.Semaphore.make("llm-gateway", 4)
+// Shared, like a contract: the object that keeps the app's semaphores.
+export const Semaphores = Restate.Semaphore.service("my-app.Semaphores")
+
+// The endpoint: register it once, provided to the implementation Layers whose handlers use permits.
+GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp) /* , … */)
+
+const gateway = Restate.Semaphore.make(Semaphores, "llm-gateway", 4)
 
 // Inside handlers: at most 4 of these steps run at once.
 const complete = (prompt: string) =>
@@ -102,12 +108,45 @@ const complete = (prompt: string) =>
   )
 ```
 
-- **A semaphore is a description; its permits live in Restate.** Its name is unique in the Restate cluster: everything that uses the name shares its permits. The virtual object `_restate-effect.Semaphores` keeps them; `Restate.layerHttp` serves it on every endpoint, so registering a deployment adds it.
+- **A semaphore is a description; its permits live in Restate.** `Restate.Semaphore.service(name)` describes the virtual object that keeps the permits, with its implementation as `.layer`. Its handlers are internal (and ingress-private): only `withPermit` calls them. One object holds any number of semaphores, one key each; within an object, a semaphore's name is unique: everything that uses the name shares its permits.
+- **A forgotten registration is a type error.** `withPermit` requires `Registered<"my-app.Semaphores">`, which only `Semaphores.layer` provides, so handlers that use permits leave it in their Layer's requirements until it is provided. A deployment that uses an object another deployment registers provides `Semaphores.layerRemote` instead. If no deployment registers it after all, Restate rejects `withPermit`'s first send: the attempt fails with `RT0018` ("the service handler … was not found") and is retried per the handler's retry policy, then paused or failed once its attempts run out (`onDefect`).
 - **Waiting is durable and first in, first out.** A waiting invocation suspends, holding nothing.
 - **The permit is released when the effect succeeds, fails for good, is cancelled or interrupted**, as `Restate.onError` runs, including while it still waits. After a defect caught around it (`Effect.catchDefect`, `Effect.exit`, …), the permit is released when the handler ends with success or a final failure, or at the next `withPermit` of the same semaphore; an uncaught defect only ends the attempt, so the retry keeps the permit.
+- **Durable cleanup around `withPermit` (`Effect.ensuring`, `onExit`, `acquireRelease`) is not replay-safe after a defect that may not repeat; use `Restate.onError`.** If a defect from plain code (outside `Restate.run`) ends one attempt but not its retry, the finalizer's durable steps in the dead attempt do not match the retry's journal: the retry fails with a journal mismatch (570) until the invocation pauses, holding its permit until the lease passes.
 - **Do not bound `withPermit` with `Effect.timeout` or `Effect.race`.** The permit is released, but the invocation then cannot await further durable operations (they fail with a defect) until the interrupted one settles. For a durable timeout, race the durable operation against `Restate.sleep` with `Restate.raceAll`. The invocation holds the permit, so its retries and replays keep it, and a nested `withPermit` of the same semaphore runs under it.
-- **A lease bounds a lost permit.** A killed invocation never releases its permit: the semaphore reclaims a permit held longer than the lease, 15 minutes unless `make(name, permits, { lease })` sets it. A holder still running then loses its permit without knowing, so set the lease above the longest hold, retries and suspensions included. The lease cannot be renewed yet; a release cancels its lease's scheduled expiry.
-- **Limits.** Each semaphore is one virtual-object key, so its acquires and releases run one at a time: a few hundred per second at most. Every deployment serves `_restate-effect.Semaphores`, and Restate routes it to the latest registered one, so keep deployments on compatible library versions.
+- **A lease bounds a lost permit.** A killed invocation never releases its permit: the semaphore reclaims a permit held longer than the lease, 15 minutes unless `make(service, name, permits, { lease })` sets it. A holder still running then loses its permit without knowing, so set the lease above the longest hold, retries and suspensions included. The lease cannot be renewed yet; a release cancels its lease's scheduled expiry.
+- **Wide types.** `Restate.Semaphore.Semaphore` and `Restate.Semaphore.Service` without a type argument accept any semaphore or object, for fields and helpers; `withPermit` of such a semaphore is satisfied by any object's Layer, so the check of which one is lost.
+- **Limits.** Each semaphore is one virtual-object key, so its acquires and releases run one at a time: a few hundred per second at most. The app registers the object once; if several deployments register it, Restate routes it to the latest, so keep them on compatible library versions.
+
+### Migrating from 0.5
+
+0.6.0 makes a forgotten registration a type error. `withPermit` requires `Registered<name>`, which `Semaphores.layer` provides, so provide the Layer to the implementation Layers that use permits instead of merging it beside them. A deployment that uses an object served by another deployment provides `Semaphores.layerRemote`. `Service` no longer exposes the object's contract (`toLayer`, handlers, `Restate.client`).
+
+```diff
+-Layer.mergeAll(GreeterLive, Semaphores.layer).pipe(Layer.provide(Restate.layerHttp))
++GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp))
+```
+
+The object's name, keys and state are unchanged, so permits carry over.
+
+### Migrating from 0.4
+
+0.5.0 removed the built-in `_restate-effect.Semaphores` object, which `Restate.layerHttp` served on every endpoint. Make the object yourself, provide its Layer to the implementation Layers that use permits, and pass it to `make`:
+
+```diff
++const Semaphores = Restate.Semaphore.service("my-app.Semaphores")
+-const gateway = Restate.Semaphore.make("llm-gateway", 4)
++const gateway = Restate.Semaphore.make(Semaphores, "llm-gateway", 4)
+-GreeterLive.pipe(Layer.provide(Restate.layerHttp))
++GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp))
+```
+
+Permits held or awaited in `_restate-effect.Semaphores` are not moved to a new name. Either:
+
+- **Keep the old name:** `Restate.Semaphore.service("_restate-effect.Semaphores")` reads the existing permit state, so holders and waiters carry over; or
+- **Stop traffic and drain first:** let every invocation that holds or awaits a permit finish before deploying the new name.
+
+Otherwise, during a rolling or blue-green upgrade, invocations on the old deployment use the old object and new ones the new object: two permit pools, so up to twice the limit runs at once until the old invocations finish. Keep the old deployment registered until its leases have passed (15 minutes by default): 0.4.0 left each grant's lease expiry scheduled, and those calls still go to the old object. Restate removes whole deployments, not single services, so the old object goes away when the last deployment that serves it is removed.
 
 The semaphore waits with an awakeable, which is available on its own: `Restate.awakeable(schema)` returns an `id` and a `promise` that suspends until another handler calls `Restate.resolveAwakeable(id, schema, value)`. Rejecting an awakeable is not wrapped yet.
 

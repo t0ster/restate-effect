@@ -130,7 +130,7 @@ export class Endpoint extends Context.Service<Endpoint, {
   readonly register: (definition: Definition) => Effect.Effect<void>
 }>()("restate-effect/Endpoint") {}
 
-/** Serves every registered service as one Restate endpoint, mounted on `HttpRouter`; `layerHttp` adds the built-in services. */
+/** Serves every registered service as one Restate endpoint, mounted on `HttpRouter`. */
 export const layerEndpoint: Layer.Layer<Endpoint, never, HttpRouter.HttpRouter> = Layer.effect(Endpoint)(Effect.gen(function* () {
   const router = yield* HttpRouter.HttpRouter
   const definitions = new Map<string, Definition>()

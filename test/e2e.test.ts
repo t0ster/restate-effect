@@ -153,28 +153,34 @@ void test("a retried failure's delay overrides the backoff", { timeout: 120_000 
 
 // Restate.Semaphore (fixture: test/semaphore.ts). Holders hold a permit until the test opens their
 // gate (an awakeable); the fixture records when each one entered and left its permit.
-void describe("Restate.Semaphore", () => {
+// On Node, every test; on Bun, the tests marked "(also on Bun)". Each runtime has services of its own.
+const semaphoreTests = (runtime: "node" | "bun", port: number) => describe(`Restate.Semaphore on ${runtime}`, () => {
+  const prefix = `e2e-${runtime}`
+  const holders = `${prefix}.Holders`
+  const it = (name: string, options: { timeout: number }, fn: () => Promise<void>) => {
+    if (runtime === "node" || name.includes("(also on Bun)")) void test(name, options, fn)
+  }
   let server: ReturnType<typeof start>
   before(async () => {
-    server = start("node", ["test/semaphore.ts"], { PORT: "29183" })
+    server = start(runtime, ["test/semaphore.ts"], { PORT: String(port), PREFIX: prefix })
     await waitFor("the semaphore endpoint", async () => server.output().includes("Listening on"), 30)
-    await register(29183)
+    await register(port)
   })
   after(() => stop(server))
 
   type Event = { readonly id: string; readonly event: "enter" | "exit" | "died"; readonly at: number }
   const events = async (ids: ReadonlyArray<string>) =>
-    (await call("Holders/events", null) as ReadonlyArray<Event>).filter(e => ids.includes(e.id))
+    (await call(`${holders}/events`, null) as ReadonlyArray<Event>).filter(e => ids.includes(e.id))
   const entered = async (id: string) => (await events([id])).some(e => e.event === "enter")
   /** Starts a holder without waiting for it; returns its invocation ID, which is its holder ID. */
-  const hold = async (semaphore: string, id: string, options: { until?: "opened" | number; fail?: boolean; flaky?: boolean; nested?: boolean; die?: "caught" | "uncaught"; timeout?: number } = {}) => {
-    const response = await fetch(`${ingress}/Holders/hold/send`, {
+  const hold = async (semaphore: string, id: string, options: { until?: "opened" | number; fail?: boolean; flaky?: boolean; nested?: boolean; die?: "caught" | "uncaught" | "fatal"; timeout?: number } = {}, handler: "hold" | "crash" = "hold") => {
+    const response = await fetch(`${ingress}/${holders}/${handler}/send`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore, id, until: "opened", ...options })
     })
     assert.ok(response.ok, `hold ${id}: ${response.status} ${await response.clone().text()}`)
     return (await response.json() as { invocationId: string }).invocationId
   }
-  const open = async (id: string) => assert.equal(await call("Holders/open", id), true, `${id} has a gate`)
+  const open = async (id: string) => assert.equal(await call(`${holders}/open`, id), true, `${id} has a gate`)
   /** How an invocation ended: its HTTP status and body, once it has. */
   const outcome = async (invocationId: string) => {
     const response = await fetch(`${ingress}/restate/invocation/${invocationId}/attach`)
@@ -192,8 +198,8 @@ void describe("Restate.Semaphore", () => {
     return (await response.json() as { rows: ReadonlyArray<Record<string, unknown>> }).rows
   }
   /** A semaphore's state in Restate: who holds a permit, grants so far, and who waits, in order. */
-  const semaphore = async (name: string) => {
-    const rows = await query(`SELECT key, value_utf8 FROM state WHERE service_name = '_restate-effect.Semaphores' AND service_key = '${name}'`)
+  const semaphore = async (name: string, service = `${prefix}.Semaphores`) => {
+    const rows = await query(`SELECT key, value_utf8 FROM state WHERE service_name = '${service}' AND service_key = '${name}'`)
     const values = new Map(rows.map(row => [row.key as string, JSON.parse(row.value_utf8 as string)]))
     const ledger = values.get("ledger") as { holders: ReadonlyArray<{ holder: string }>; grants: number } | undefined
     const waiting = [...values.entries()]
@@ -213,14 +219,14 @@ void describe("Restate.Semaphore", () => {
   }
   /** How many lease expiries of a semaphore Restate still has scheduled. */
   const scheduledExpiries = async (name: string) => (await query(
-    `SELECT count(*) AS n FROM sys_invocation WHERE target_service_name = '_restate-effect.Semaphores' AND target_service_key = '${name}' AND target_handler_name = 'expire' AND status = 'scheduled'`
+    `SELECT count(*) AS n FROM sys_invocation WHERE target_service_name = '${prefix}.Semaphores' AND target_service_key = '${name}' AND target_handler_name = 'expire' AND status = 'scheduled'`
   ))[0]!.n as number
   /** The semaphore handlers an invocation sent to, with how often. */
   const sentBy = async (invocationId: string) => Object.fromEntries((await query(
-    `SELECT target_handler_name AS handler, count(*) AS n FROM sys_invocation WHERE target_service_name = '_restate-effect.Semaphores' AND invoked_by_id = '${invocationId}' GROUP BY target_handler_name`
+    `SELECT target_handler_name AS handler, count(*) AS n FROM sys_invocation WHERE target_service_name = '${prefix}.Semaphores' AND invoked_by_id = '${invocationId}' GROUP BY target_handler_name`
   )).map(row => [row.handler as string, row.n as number]))
 
-  void test("at most `permits` holders at once", { timeout: 60_000 }, async () => {
+  it("at most `permits` holders at once", { timeout: 60_000 }, async () => {
     const ids = Array.from({ length: 6 }, (_, i) => `cap-${i}`)
     const holders = await Promise.all(ids.map(id => hold("cap", id, { until: 300 })))   // all at once, 2 permits
     for (const [i, holder] of holders.entries()) assert.deepEqual(await outcome(holder), { status: 200, body: ids[i] })
@@ -237,7 +243,7 @@ void describe("Restate.Semaphore", () => {
     await waitFor("no expiry scheduled", async () => await scheduledExpiries("e2e-cap") === 0, 30)
   })
 
-  void test("waiters get the permit first in, first out", { timeout: 60_000 }, async () => {
+  it("waiters get the permit first in, first out", { timeout: 60_000 }, async () => {
     const ids = ["fifo-a", "fifo-b", "fifo-c", "fifo-d"]
     const holders = [await hold("fifo", ids[0]!)]
     await waitFor("fifo-a to hold", () => entered("fifo-a"), 30)
@@ -255,7 +261,7 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-fifo"), 4)
   })
 
-  void test("a holder that fails or is cancelled releases its permit", { timeout: 60_000 }, async () => {
+  it("a holder that fails or is cancelled releases its permit", { timeout: 60_000 }, async () => {
     const failing = await hold("release", "release-a", { fail: true })
     await waitFor("release-a to hold", () => entered("release-a"), 30)
     const cancelled = await hold("release", "release-b")
@@ -281,7 +287,7 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-release"), 3)
   })
 
-  void test("a waiter cancelled in the queue leaves it: no permit goes to it", { timeout: 60_000 }, async () => {
+  it("a waiter cancelled in the queue leaves it: no permit goes to it", { timeout: 60_000 }, async () => {
     const first = await hold("queue", "queue-a")
     await waitFor("queue-a to hold", () => entered("queue-a"), 30)
     const cancelled = await hold("queue", "queue-b")
@@ -303,7 +309,7 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-queue"), 2)
   })
 
-  void test("the lease reclaims the permit of a killed holder, and of a killed waiter", { timeout: 60_000 }, async () => {
+  it("the lease reclaims the permit of a killed holder, and of a killed waiter", { timeout: 60_000 }, async () => {
     const holder = await hold("lease", "lease-a")   // a 3-second lease
     await waitFor("lease-a to hold", () => entered("lease-a"), 30)
     const killedWaiter = await hold("lease", "lease-b")
@@ -326,7 +332,7 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-lease"), 3)
   })
 
-  void test("a holder's retries and replays keep its permit", { timeout: 60_000 }, async () => {
+  it("a holder's retries and replays keep its permit", { timeout: 60_000 }, async () => {
     // Under the permit, its step fails twice, then its attempt dies: Restate replays it, three times.
     const flaky = await hold("retry", "retry-a", { flaky: true })
     await waitFor("retry-a to die once", async () => (await events(["retry-a"])).some(e => e.event === "died"), 30)
@@ -343,7 +349,7 @@ void describe("Restate.Semaphore", () => {
     assert.deepEqual(await sentBy(flaky), { acquire: 1, release: 1 })
   })
 
-  void test("a nested withPermit of the same semaphore runs under the permit held", { timeout: 60_000 }, async () => {
+  it("a nested withPermit of the same semaphore runs under the permit held", { timeout: 60_000 }, async () => {
     const nested = await hold("nested", "nested-a", { nested: true })
     await waitFor("nested-a to hold", () => entered("nested-a"), 30)
     const waiter = await hold("nested", "nested-b")
@@ -357,7 +363,7 @@ void describe("Restate.Semaphore", () => {
     assert.deepEqual(await sentBy(nested), { acquire: 1, release: 1 })
   })
 
-  void test("a defect caught around withPermit releases the permit when the handler ends", { timeout: 60_000 }, async () => {
+  it("a defect caught around withPermit releases the permit when the handler ends", { timeout: 60_000 }, async () => {
     // Caught, then a 3-second durable sleep: it holds the permit until the handler ends.
     const caught = await hold("defect", "defect-a", { die: "caught", until: 3000 })
     await waitFor("defect-a to hold", () => entered("defect-a"), 30)
@@ -368,7 +374,7 @@ void describe("Restate.Semaphore", () => {
     assert.deepEqual(await sentBy(caught), { acquire: 1, release: 1 })
   })
 
-  void test("an uncaught defect keeps the permit across retries, even with a durable finalizer", { timeout: 60_000 }, async () => {
+  it("an uncaught defect keeps the permit across retries, even with a durable finalizer", { timeout: 60_000 }, async () => {
     // Dies in every attempt; a durable step in an Effect.ensuring around withPermit runs each time.
     const dying = await hold("ensure", "ensure-a", { die: "uncaught" })
     await waitFor("ensure-a to hold", () => entered("ensure-a"), 30)
@@ -386,7 +392,7 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-ensure"), 2)
   })
 
-  void test("an Effect.timeout around withPermit releases the permit, also while waiting", { timeout: 60_000 }, async () => {
+  it("an Effect.timeout around withPermit releases the permit, also while waiting", { timeout: 60_000 }, async () => {
     const first = await hold("timeout", "timeout-a")
     await waitFor("timeout-a to hold", () => entered("timeout-a"), 30)
     // Times out in the queue: it leaves it, so no permit goes to it.
@@ -403,4 +409,45 @@ void describe("Restate.Semaphore", () => {
     for (const id of [waiter, holder]) assert.deepEqual(await sentBy(id), { acquire: 1, release: 1 })
     await waitFor("no expiry scheduled", async () => await scheduledExpiries("e2e-timeout") === 0, 30)
   })
+
+  it("a semaphore object with an app-chosen name", { timeout: 60_000 }, async () => {
+    const first = await hold("named", "named-a")
+    await waitFor("named-a to hold", () => entered("named-a"), 30)
+    const waiter = await hold("named", "named-b")
+    await waitFor("named-b to wait", async () => (await semaphore("e2e-named", `${prefix}.app.Limits`)).waiting.includes(waiter), 30)
+    assert.deepEqual((await semaphore("e2e-named", `${prefix}.app.Limits`)).holders, [first])
+    assert.deepEqual(await semaphore("e2e-named"), { holders: [], grants: 0, waiting: [] }, "nothing in the other object")
+    await open("named-a")
+    await waitFor("named-b to hold", () => entered("named-b"), 30)
+    await open("named-b")
+    for (const id of [first, waiter]) assert.equal((await outcome(id)).status, 200)
+    await waitFor("e2e-named to be idle", async () => (await semaphore("e2e-named", `${prefix}.app.Limits`)).holders.length === 0, 30)
+  })
+
+  it("withPermit against an object that no deployment registers (layerRemote) fails its attempts with RT0018", { timeout: 60_000 }, async () => {
+    const holder = await hold("missing", "missing-a")
+    // Restate rejects the send to the unknown object, so the attempt fails, with a clear error, and retries.
+    await waitFor("the RT0018 failure", async () => {
+      const [row] = await query(`SELECT last_failure_error_code AS code, last_failure AS failure FROM sys_invocation WHERE id = '${holder}'`)
+      return row?.code === "RT0018" && String(row.failure).includes(`${prefix}.Unregistered/acquire was not found`)
+    }, 30)
+    assert.equal(await entered("missing-a"), false)
+    await manage(holder, "kill")
+  })
+
+  it("a crash under the permit, with onDefect: \"fail\", releases it to the next waiter (also on Bun)", { timeout: 60_000 }, async () => {
+    const crashing = await hold("crash", `crash-a`, { die: "fatal" }, "crash")
+    await waitFor("crash-a to hold", () => entered("crash-a"), 30)
+    const waiter = await hold("crash", "crash-b")
+    await waits("e2e-crash", waiter)
+    await open("crash-a")   // then it dies: the invocation fails at once
+    assert.equal((await outcome(crashing)).status, 500)
+    await waitFor("crash-b to hold", () => entered("crash-b"), 30)
+    await open("crash-b")
+    assert.equal((await outcome(waiter)).status, 200)
+    assert.equal(await idle("e2e-crash"), 2)
+    assert.deepEqual(await sentBy(crashing), { acquire: 1, release: 1 })
+  })
 })
+void semaphoreTests("node", 29183)
+void semaphoreTests("bun", 29184)
