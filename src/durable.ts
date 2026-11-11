@@ -41,10 +41,13 @@ export function fromRejection<E>(error: unknown): Effect.Effect<never, E> {
   return Effect.die(error)
 }
 
-/** Awaits a RestatePromise (or any promise) as an Effect, following the rejection protocol. */
-export const awaitPromise = <A, E>(promise: () => PromiseLike<A>): Effect.Effect<A, E> =>
-  Effect.callback<A, E>(resume => {
-    promise().then(value => resume(Effect.succeed(value)), error => resume(fromRejection<E>(error)))
+/**
+ * Awaits a RestatePromise (or any promise) as an Effect, following the rejection protocol. The
+ * signal aborts if the Effect is interrupted, as by `Effect.timeout`; the promise keeps running.
+ */
+export const awaitPromise = <A, E>(promise: (signal: AbortSignal) => PromiseLike<A>): Effect.Effect<A, E> =>
+  Effect.callback<A, E>((resume, signal) => {
+    promise(signal).then(value => resume(Effect.succeed(value)), error => resume(fromRejection<E>(error)))
   })
 
 /**
@@ -63,7 +66,7 @@ export class Durable<A, E = never, R = Invocation> extends Effectable.Class<A, E
       Effect.context<R | Invocation>(),
       context => {
         const invocation = Context.get(context, Invocation)
-        return awaitPromise<A, E>(() => invocation.execute(() => this.issue(invocation, context as Context.Context<R>)))
+        return awaitPromise<A, E>(signal => invocation.execute(() => this.issue(invocation, context as Context.Context<R>), signal))
       }
     ) as Effect.Effect<A, E, R>
   }

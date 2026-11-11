@@ -7,6 +7,7 @@ import type { BoundHandlers, Contract, HandlerServerOptions, Handlers, Kind, Ret
 import { millis } from "./duration.js"
 import { Invocation, Keyed, StateReader, StateWriter, invocationState } from "./invocation.js"
 import { Transport, invocationTransport } from "./client.js"
+import { isFinal } from "./durable.js"
 
 type Definition = sdk.ServiceDefinition<string, unknown> | sdk.VirtualObjectDefinition<string, unknown> | sdk.WorkflowDefinition<string, unknown>
 
@@ -45,6 +46,8 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
         )
         const signal = request.attemptCompletedSignal
         const exit = await Effect.runPromiseExitWith(context)(program, { signal })
+        // Deferred work (a caught defect's release) runs when the handler ends for good, not when only the attempt does.
+        if (!signal.aborted && (Exit.isSuccess(exit) || isFinal(invocation, exit.cause))) invocation.flush()
         if (Exit.isFailure(exit) && !signal.aborted) {
           // Interrupted, not by the end of the attempt: cancelled, so the invocation ends as cancelled.
           if (Cause.hasInterruptsOnly(exit.cause)) throw new sdk.CancelledError()
@@ -127,7 +130,7 @@ export class Endpoint extends Context.Service<Endpoint, {
   readonly register: (definition: Definition) => Effect.Effect<void>
 }>()("restate-effect/Endpoint") {}
 
-/** Serves every registered service as one Restate endpoint, mounted on `HttpRouter`; `layerHttp` adds the built-in services. */
+/** Serves every registered service as one Restate endpoint, mounted on `HttpRouter`. */
 export const layerEndpoint: Layer.Layer<Endpoint, never, HttpRouter.HttpRouter> = Layer.effect(Endpoint)(Effect.gen(function* () {
   const router = yield* HttpRouter.HttpRouter
   const definitions = new Map<string, Definition>()

@@ -196,10 +196,10 @@ export const layerIngress = (options: Parameters<typeof ingressSdk.connect>[0]) 
 /** Used only by the handler adapter, with a fresh context for each invocation. */
 export const invocationTransport = (
   ctx: sdk.Context,
-  execute: <A>(operation: () => PromiseLike<A>) => Promise<A>
+  execute: <A>(operation: () => PromiseLike<A>, signal?: AbortSignal) => Promise<A>
 ): Context.Service.Shape<typeof Transport> => ({
   call: call => Effect.tryPromise({
-    try: () => execute(async () => {
+    try: signal => execute(async () => {
       const send = () => ctx.genericSend({
         service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
         inputSerde: cachedSerde(call.handler.input), delay: millis(call.options?.delay),
@@ -209,7 +209,7 @@ export const invocationTransport = (
       // A workflow runs once per key: send (which joins a started run), then attach to it.
       if (isWorkflowRun(call)) return command(ctx, { ...call, operation: "attach", invocationId: await send() as unknown as InvocationId })
       return command(ctx, call)
-    }),
+    }, signal),
     catch: cause => clientError(call, cause)
   })
 })

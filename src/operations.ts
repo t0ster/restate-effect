@@ -17,7 +17,7 @@ export const sleep = (duration: Duration.Input): Durable<void, never, Invocation
 
 /** The current time, journaled: a replay sees the same value. */
 export const now: Effect.Effect<DateTime.Utc, never, Invocation> = Effect.flatMap(Invocation, invocation =>
-  awaitPromise<number, never>(() => invocation.execute(() => invocation.ctx.date.now()))
+  awaitPromise<number, never>(signal => invocation.execute(() => invocation.ctx.date.now(), signal))
 ).pipe(Effect.map(millis => DateTime.makeUnsafe(millis)))
 
 /** The key of the current object or workflow. */
@@ -148,10 +148,10 @@ const writeState = (write: (ctx: sdk.ObjectContext) => void): Effect.Effect<void
 export const state = {
   get: <S extends Codec>(key: string, schema: S): Effect.Effect<S["Type"] | null, ClientError, StateReader> =>
     Effect.flatMap(StateReader, invocation => Effect.tryPromise({
-      try: () => invocation.execute(() => {
+      try: signal => invocation.execute(() => {
         if (!invocation.stateful) throw new Error("State is only available on objects and workflows")
         return (invocation.ctx as sdk.ObjectSharedContext).get(key, cachedSerde(schema))
-      }),
+      }, signal),
       catch: cause => new ClientError({ service: "<invocation>", method: "get", cause })
     }).pipe(
       // Its errors stay in the typed channel; cancellation interrupts.
