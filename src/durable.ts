@@ -3,7 +3,7 @@ import type { Pipeable } from "effect"
 import * as sdk from "@restatedev/restate-sdk"
 import { singleFailure } from "./codec.js"
 import { Invocation, stateOf, type InvocationApi, type InvocationState } from "./invocation.js"
-import type { ClientError } from "./errors.js"
+import { ClientError } from "./errors.js"
 import type { Transport } from "./client.js"
 
 /**
@@ -148,6 +148,9 @@ export const join = <A, E>(fiber: Fiber<A, E>): Durable<A, E, Invocation> => new
 export const isFinal = (invocation: InvocationState, cause: Cause.Cause<unknown>): boolean => {
   if (invocation.ctx.request().attemptCompletedSignal.aborted) return false
   if (Cause.hasInterruptsOnly(cause)) return true                                    // cancellation
-  if (singleFailure(cause)) return true                                              // declared failure
+  const failure = singleFailure(cause)
+  // As in unwrapExit: a ClientError ends the invocation only when its cause is a TerminalError;
+  // any other cause is rethrown as a plain error, and Restate retries.
+  if (failure) return !(failure.error instanceof ClientError) || failure.error.cause instanceof sdk.TerminalError
   return invocation.onDefect === "fail"                                              // defect
 }

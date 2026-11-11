@@ -6,7 +6,10 @@
       "rules": {
         "no-restricted-imports": ["error", {
           "patterns": [{
-            "group": ["../*", "@t0ster/restate-effect/*", "!@t0ster/restate-effect/semaphore"],
+            "regex": "^(\\.\\.|/)",
+            "message": "src/semaphore uses only the package's public entry: import { Restate } from \"@t0ster/restate-effect\"."
+          }, {
+            "group": ["@t0ster/restate-effect/**", "!@t0ster/restate-effect/semaphore"],
             "message": "src/semaphore uses only the package's public entry: import { Restate } from \"@t0ster/restate-effect\"."
           }]
         }]

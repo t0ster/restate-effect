@@ -10,7 +10,7 @@ import { Restate } from "@t0ster/restate-effect"
 
 export class Refused extends Schema.Error<Refused>("Refused")({ _tag: Schema.tag("Refused") }) {}
 
-const Scenario = Schema.Literals(["success", "failure", "cancelled", "caught", "retried", "crash", "keyed", "timeout"])
+const Scenario = Schema.Literals(["success", "failure", "cancelled", "caught", "retried", "crash", "keyed", "timeout", "transient"])
 const Run = Restate.handler({ input: Schema.Struct({ id: Schema.String, scenario: Scenario }), success: Schema.String, error: Refused })
 
 export const Cleanup = Restate.service("Cleanup", {
@@ -63,6 +63,15 @@ const run = ({ id, scenario }: typeof Run.input.Type) => Effect.gen(function* ()
         if (failedOnce.has(id)) return Effect.succeed("retried")
         failedOnce.add(id)
         return Effect.die(new Error("the first attempt dies"))
+      })), cleanup)
+    }
+    case "transient": {
+      // The first attempt fails with a ClientError whose cause is not a TerminalError: Restate
+      // retries it, so only the attempt ends and nothing runs; the retry succeeds.
+      return yield* Restate.ensuring(Effect.andThen(step(id, "body"), Effect.suspend(() => {
+        if (failedOnce.has(id)) return Effect.succeed("transient")
+        failedOnce.add(id)
+        return Effect.fail(new Restate.ClientError({ service: "Cleanup", method: "run", cause: new Error("transient") }))
       })), cleanup)
     }
     case "keyed": {

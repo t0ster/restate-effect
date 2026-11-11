@@ -12,6 +12,8 @@ Requires Effect 4.1, Restate TypeScript SDK 1.18 and Restate Server 1.8+. Older 
 
 To host a service on Node, also install `@effect/platform-node`.
 
+`import { Restate } from "@t0ster/restate-effect"` and `import * as Restate from "@t0ster/restate-effect/Restate"` (a flat module, like `effect/Effect`) give the same API.
+
 ## Usage
 
 Define a contract, then implement it. Callers only need the contract, so it can live in a shared package.

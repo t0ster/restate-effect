@@ -229,6 +229,13 @@ void describe("durable cleanup", () => {
     assert.deepEqual(events.slice(0, 3), ["attempt", "body", "attempt"])
   })
 
+  void test("a ClientError with a non-terminal cause ends only the attempt: nothing runs until the retry ends", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("transient", "transient"), { status: 200, body: "transient" })
+    const events = await recorded("transient")
+    assert.deepEqual(events.filter(e => e !== "attempt"), ["body", "cleanup", "final:success"])
+    assert.deepEqual(events.slice(0, 3), ["attempt", "body", "attempt"])
+  })
+
   void test("a defect with onDefect: \"fail\" runs both at once", { timeout: 60_000 }, async () => {
     assert.equal((await scenario("crash", "crash", "crash")).status, 500)
     assert.deepEqual(await ran("crash"), ["body", "cleanup", "final:failure"])
@@ -549,7 +556,12 @@ void semaphoreTests("bun", 29184)
 
 // Upgrading from 0.6: invocations that hold or wait for a permit under 0.6 (Restate.Semaphore)
 // replay under 0.7 (the semaphore subpath) when the endpoint at the same URI is upgraded.
-void test("permits and in-flight invocations carry over from 0.6", { timeout: 180_000 }, async () => {
+// Needs the v0.6.0 tag: shallow or tagless checkouts skip (`git fetch origin tag v0.6.0`).
+const hasV060 = spawnSync("git", ["rev-parse", "--verify", "--quiet", "v0.6.0^{commit}"], { stdio: "ignore" }).status === 0
+void test("permits and in-flight invocations carry over from 0.6", {
+  timeout: 180_000,
+  skip: hasV060 ? false : "tag v0.6.0 missing: run `git fetch origin tag v0.6.0`"
+}, async () => {
   const port = 29186
   const prefix = "e2e-compat"
   const holders = `${prefix}.Holders`

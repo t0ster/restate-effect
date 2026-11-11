@@ -1,6 +1,6 @@
 {
   "name": "@t0ster/restate-effect",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Restate services for Effect: handlers are Effects, errors are typed across the wire, durable operations compose like Effects",
   "license": "MIT",
   "author": "Roman Dolgyi <tosters@gmail.com>",
@@ -23,6 +23,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./Restate": {
+      "types": "./dist/Restate.d.ts",
+      "import": "./dist/Restate.js"
     },
     "./semaphore": {
       "types": "./dist/semaphore/index.d.ts",
