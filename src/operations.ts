@@ -107,6 +107,36 @@ const retryDelay = (delay: Duration.Input | undefined): number | undefined => {
   return millis === undefined || !Number.isFinite(millis) ? undefined : Math.max(0, Math.ceil(millis))
 }
 
+/** A durable promise that another invocation resolves by `id`, with `Restate.resolveAwakeable`. */
+export interface Awakeable<A> {
+  /** Pass it to whoever resolves the awakeable. */
+  readonly id: string
+  /**
+   * The value it is resolved with. Awaiting it suspends the invocation, holding nothing, until then;
+   * cancellation interrupts it. A Durable, so `Restate.raceAll` can race it against a timeout.
+   */
+  readonly promise: Durable<A, never, Invocation>
+}
+
+/**
+ * Creates an awakeable: a durable promise another invocation resolves by its `id`. Its value is
+ * decoded with `schema`. A replay creates the same awakeable, with the same ID.
+ */
+export const awakeable = <S extends Codec>(schema: S): Effect.Effect<Awakeable<S["Type"]>, never, Invocation> =>
+  Effect.flatMap(Invocation, invocation => Effect.sync(() => {
+    invocation.assertReady()
+    const { id, promise } = invocation.ctx.awakeable(cachedSerde(schema))
+    return { id, promise: new Durable<S["Type"], never, Invocation>(() => promise) }
+  }))
+
+/** Resolves the awakeable `id` with `value`, encoded with `schema`, waking the invocation awaiting it. Journaled: a replay does not resolve it again. */
+export const resolveAwakeable = <S extends Codec>(id: string, schema: S, value: S["Type"]): Effect.Effect<void, never, Invocation> =>
+  Effect.flatMap(Invocation, invocation => Effect.sync(() => {
+    invocation.assertReady()
+    // Encoded here: the SDK would send an undefined value (Schema.Void's) as an empty body, not as the schema encodes it.
+    invocation.ctx.resolveAwakeable(id, cachedSerde(schema).serialize(value), sdk.serde.binary)
+  }))
+
 /** A state write: only exclusive object handlers and workflow `run` can write. */
 const writeState = (write: (ctx: sdk.ObjectContext) => void): Effect.Effect<void, never, StateWriter> =>
   Effect.flatMap(StateWriter, invocation => Effect.sync(() => {
