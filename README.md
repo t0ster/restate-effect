@@ -85,7 +85,28 @@ Handler dependencies become requirements of the implementation Layer, provided o
 - Declared handler errors are final, typed failures; Restate does not retry them. By default, defects are retried, then the invocation pauses for an operator to fix and resume. Set `onDefect: "fail"` to fail immediately instead.
 - Use `Restate.onError` for durable cleanup on final failure or cancellation. Ordinary Effect finalizers run whenever an attempt ends, including retries.
 
-The [example](example/app.ts) shows these patterns, including step retries, delayed calls and waiting for workflow results. Signals, awakeables, workflow durable promises and explicit cancellation APIs are not wrapped; the raw SDK context is available as `Restate.Invocation`.
+The [example](example/app.ts) shows these patterns, including step retries, delayed calls and waiting for workflow results. Signals, workflow durable promises and explicit cancellation APIs are not wrapped; the raw SDK context is available as `Restate.Invocation`.
+
+## Concurrency limits
+
+`Restate.Semaphore` caps how many invocations do something at once, across every handler and process, such as calls to an API that allows four in flight:
+
+```ts
+const gateway = Restate.Semaphore.make("llm-gateway", 4)
+
+// Inside handlers: at most 4 of these steps run at once.
+const complete = (prompt: string) =>
+  Restate.run("complete", callGateway(prompt), { success: Schema.String, error: GatewayError }).pipe(
+    Restate.Semaphore.withPermit(gateway)
+  )
+```
+
+- **A semaphore is a description; its permits live in Restate.** Its name is unique in the Restate cluster: everything that uses the name shares its permits. The virtual object `_restate-effect.Semaphores` keeps them; `Restate.layerHttp` serves it on every endpoint, so registering a deployment adds it.
+- **Waiting is durable and first in, first out.** A waiting invocation suspends, holding nothing.
+- **The permit is released when the effect succeeds, fails for good or is cancelled**, as `Restate.onError` runs, including while it still waits. The invocation holds the permit, so its retries and replays keep it, and a nested `withPermit` of the same semaphore runs under it.
+- **A lease bounds a lost permit.** A killed invocation never releases its permit: the semaphore reclaims a permit held longer than the lease, 15 minutes unless `make(name, permits, { lease })` sets it. A holder still running then loses its permit without knowing, so set the lease above the longest hold, retries and suspensions included.
+
+The semaphore waits with an awakeable, which is available on its own: `Restate.awakeable(schema)` returns an `id` and a `promise` that suspends until another handler calls `Restate.resolveAwakeable(id, schema, value)`.
 
 ## Development
 

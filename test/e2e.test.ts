@@ -1,7 +1,7 @@
 // End to end: serve the example under Node and under Bun, register it with a real Restate server,
 // and run the example client against it. Restate runs in Docker on the host network.
 import { type ChildProcess, spawn, spawnSync } from "node:child_process"
-import { after, before, test } from "node:test"
+import { after, before, describe, test } from "node:test"
 import assert from "node:assert/strict"
 
 const admin = "http://127.0.0.1:29070"
@@ -149,4 +149,205 @@ void test("a retried failure's delay overrides the backoff", { timeout: 120_000 
   } finally {
     await stop(server)
   }
+})
+
+// Restate.Semaphore (fixture: test/semaphore.ts). Holders hold a permit until the test opens their
+// gate (an awakeable); the fixture records when each one entered and left its permit.
+void describe("Restate.Semaphore", () => {
+  let server: ReturnType<typeof start>
+  before(async () => {
+    server = start("node", ["test/semaphore.ts"], { PORT: "29183" })
+    await waitFor("the semaphore endpoint", async () => server.output().includes("Listening on"), 30)
+    await register(29183)
+  })
+  after(() => stop(server))
+
+  type Event = { readonly id: string; readonly event: "enter" | "exit" | "died"; readonly at: number }
+  const events = async (ids: ReadonlyArray<string>) =>
+    (await call("Holders/events", null) as ReadonlyArray<Event>).filter(e => ids.includes(e.id))
+  const entered = async (id: string) => (await events([id])).some(e => e.event === "enter")
+  /** Starts a holder without waiting for it; returns its invocation ID, which is its holder ID. */
+  const hold = async (semaphore: string, id: string, options: { until?: "opened" | number; fail?: boolean; flaky?: boolean; nested?: boolean } = {}) => {
+    const response = await fetch(`${ingress}/Holders/hold/send`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore, id, until: "opened", ...options })
+    })
+    assert.ok(response.ok, `hold ${id}: ${response.status} ${await response.clone().text()}`)
+    return (await response.json() as { invocationId: string }).invocationId
+  }
+  const open = async (id: string) => assert.equal(await call("Holders/open", id), true, `${id} has a gate`)
+  /** How an invocation ended: its HTTP status and body, once it has. */
+  const outcome = async (invocationId: string) => {
+    const response = await fetch(`${ingress}/restate/invocation/${invocationId}/attach`)
+    return { status: response.status, body: await response.json() as unknown }
+  }
+  const manage = async (invocationId: string, action: "cancel" | "kill") => {
+    const response = await fetch(`${admin}/invocations/${invocationId}/${action}`, { method: "PATCH" })
+    assert.ok(response.ok, `${action}: ${response.status} ${await response.text()}`)
+  }
+  const query = async (sql: string) => {
+    const response = await fetch(`${admin}/query`, {
+      method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ query: sql })
+    })
+    assert.ok(response.ok, `query: ${response.status} ${await response.clone().text()}`)
+    return (await response.json() as { rows: ReadonlyArray<Record<string, unknown>> }).rows
+  }
+  /** A semaphore's state in Restate: who holds a permit, grants so far, and who waits, in order. */
+  const semaphore = async (name: string) => {
+    const rows = await query(`SELECT key, value_utf8 FROM state WHERE service_name = '_restate-effect.Semaphores' AND service_key = '${name}'`)
+    const values = new Map(rows.map(row => [row.key as string, JSON.parse(row.value_utf8 as string)]))
+    const ledger = values.get("ledger") as { holders: ReadonlyArray<{ holder: string }>; grants: number } | undefined
+    const waiting = [...values.entries()]
+      .filter(([key]) => key.startsWith("waiter:"))
+      .sort(([a], [b]) => Number(a.slice("waiter:".length)) - Number(b.slice("waiter:".length)))
+      .map(([, waiter]) => (waiter as { holder: string }).holder)
+    return { holders: ledger?.holders.map(h => h.holder) ?? [], grants: ledger?.grants ?? 0, waiting }
+  }
+  const waits = (name: string, holder: string) => waitFor(`${holder} to wait`, async () => (await semaphore(name)).waiting.includes(holder), 30)
+  /** Waits until nobody holds or waits, once the last release (a one-way send) has arrived; returns the grants so far. */
+  const idle = async (name: string) => {
+    await waitFor(`${name} to be idle`, async () => {
+      const { holders, waiting } = await semaphore(name)
+      return holders.length === 0 && waiting.length === 0
+    }, 30)
+    return (await semaphore(name)).grants
+  }
+  /** The semaphore handlers an invocation sent to, with how often. */
+  const sentBy = async (invocationId: string) => Object.fromEntries((await query(
+    `SELECT target_handler_name AS handler, count(*) AS n FROM sys_invocation WHERE target_service_name = '_restate-effect.Semaphores' AND invoked_by_id = '${invocationId}' GROUP BY target_handler_name`
+  )).map(row => [row.handler as string, row.n as number]))
+
+  void test("at most `permits` holders at once", { timeout: 60_000 }, async () => {
+    const ids = Array.from({ length: 6 }, (_, i) => `cap-${i}`)
+    const holders = await Promise.all(ids.map(id => hold("cap", id, { until: 300 })))   // all at once, 2 permits
+    for (const [i, holder] of holders.entries()) assert.deepEqual(await outcome(holder), { status: 200, body: ids[i] })
+    // Replayed in time order, the events never have more than 2 inside at once.
+    let inside = 0
+    let most = 0
+    for (const e of [...await events(ids)].sort((a, b) => a.at - b.at || (a.event === "exit" ? -1 : 1))) {
+      inside += e.event === "enter" ? 1 : -1
+      most = Math.max(most, inside)
+    }
+    assert.equal(most, 2)
+    assert.equal(await idle("e2e-cap"), 6)
+  })
+
+  void test("waiters get the permit first in, first out", { timeout: 60_000 }, async () => {
+    const ids = ["fifo-a", "fifo-b", "fifo-c", "fifo-d"]
+    const holders = [await hold("fifo", ids[0]!)]
+    await waitFor("fifo-a to hold", () => entered("fifo-a"), 30)
+    // One at a time, so the queue's order is known.
+    for (const id of ids.slice(1)) {
+      holders.push(await hold("fifo", id))
+      await waits("e2e-fifo", holders.at(-1)!)
+    }
+    for (const [i, id] of ids.entries()) {
+      await open(id)   // succeeds, releasing the permit to the next waiter
+      if (i + 1 < ids.length) await waitFor(`a holder after ${id}`, async () => (await events(ids)).filter(e => e.event === "enter").length > i + 1, 30)
+    }
+    for (const holder of holders) assert.equal((await outcome(holder)).status, 200)
+    assert.deepEqual((await events(ids)).filter(e => e.event === "enter").map(e => e.id), ids)
+    assert.equal(await idle("e2e-fifo"), 4)
+  })
+
+  void test("a holder that fails or is cancelled releases its permit", { timeout: 60_000 }, async () => {
+    const failing = await hold("release", "release-a", { fail: true })
+    await waitFor("release-a to hold", () => entered("release-a"), 30)
+    const cancelled = await hold("release", "release-b")
+    await waits("e2e-release", cancelled)
+
+    // A declared failure is final: the permit goes to the waiter.
+    await open("release-a")
+    const failure = await outcome(failing)
+    assert.equal(failure.status, 500, JSON.stringify(failure))
+    assert.equal((failure.body as { message: string }).message, "Refused")
+    await waitFor("release-b to hold", () => entered("release-b"), 30)
+
+    // Cancelled while holding the permit: it goes to the next waiter.
+    const last = await hold("release", "release-c")
+    await waits("e2e-release", last)
+    await manage(cancelled, "cancel")
+    const cancellation = await outcome(cancelled)
+    assert.equal(cancellation.status, 409)
+    assert.equal((cancellation.body as { message: string }).message, "Cancelled")
+    await waitFor("release-c to hold", () => entered("release-c"), 30)
+    await open("release-c")
+    assert.equal((await outcome(last)).status, 200)
+    assert.equal(await idle("e2e-release"), 3)
+  })
+
+  void test("a waiter cancelled in the queue leaves it: no permit goes to it", { timeout: 60_000 }, async () => {
+    const first = await hold("queue", "queue-a")
+    await waitFor("queue-a to hold", () => entered("queue-a"), 30)
+    const cancelled = await hold("queue", "queue-b")
+    await waits("e2e-queue", cancelled)
+    const last = await hold("queue", "queue-c")
+    await waits("e2e-queue", last)
+
+    await manage(cancelled, "cancel")
+    assert.equal((await outcome(cancelled)).status, 409)
+    await waitFor("queue-b to leave the queue", async () => !(await semaphore("e2e-queue")).waiting.includes(cancelled), 30)
+    assert.deepEqual((await semaphore("e2e-queue")).waiting, [last])
+
+    // The permit goes to queue-c at once, not to queue-b (it would keep it for its 15-minute lease).
+    await open("queue-a")
+    await waitFor("queue-c to hold", () => entered("queue-c"), 30)
+    await open("queue-c")
+    for (const holder of [first, last]) assert.equal((await outcome(holder)).status, 200)
+    assert.equal(await entered("queue-b"), false)
+    assert.equal(await idle("e2e-queue"), 2)
+  })
+
+  void test("the lease reclaims the permit of a killed holder, and of a killed waiter", { timeout: 60_000 }, async () => {
+    const holder = await hold("lease", "lease-a")   // a 3-second lease
+    await waitFor("lease-a to hold", () => entered("lease-a"), 30)
+    const killedWaiter = await hold("lease", "lease-b")
+    await waits("e2e-lease", killedWaiter)
+    const waiter = await hold("lease", "lease-c")
+    await waits("e2e-lease", waiter)
+
+    // Killed, no cleanup runs: lease-a keeps its permit until its lease passes; then lease-b, still
+    // in the queue, gets the permit, which it keeps for a lease too.
+    for (const killed of [holder, killedWaiter]) {
+      await manage(killed, "kill")
+      assert.equal((await outcome(killed)).status, 409)
+    }
+    await waitFor("lease-c to hold", () => entered("lease-c"), 30)
+    const [a, c] = await Promise.all(["lease-a", "lease-c"].map(async id => (await events([id])).find(e => e.event === "enter")!.at))
+    assert.ok(c! - a! >= 5000 && c! - a! < 20_000, `lease-c got the permit ${c! - a!}ms after lease-a: two leases`)
+    assert.equal(await entered("lease-b"), false)
+    await open("lease-c")
+    assert.equal((await outcome(waiter)).status, 200)
+    assert.equal(await idle("e2e-lease"), 3)
+  })
+
+  void test("a holder's retries and replays keep its permit", { timeout: 60_000 }, async () => {
+    // Under the permit, its step fails twice, then its attempt dies: Restate replays it, three times.
+    const flaky = await hold("retry", "retry-a", { flaky: true })
+    await waitFor("retry-a to die once", async () => (await events(["retry-a"])).some(e => e.event === "died"), 30)
+    const waiter = await hold("retry", "retry-b")
+    await waits("e2e-retry", waiter)
+    assert.deepEqual((await semaphore("e2e-retry")).holders, [flaky])   // still the holder, under its first grant
+
+    await open("retry-a")
+    await waitFor("retry-b to hold", () => entered("retry-b"), 30)
+    await open("retry-b")
+    for (const holder of [flaky, waiter]) assert.equal((await outcome(holder)).status, 200)
+    assert.equal(await idle("e2e-retry"), 2)
+    // However often it ran, it acquired once and released once.
+    assert.deepEqual(await sentBy(flaky), { acquire: 1, release: 1 })
+  })
+
+  void test("a nested withPermit of the same semaphore runs under the permit held", { timeout: 60_000 }, async () => {
+    const nested = await hold("nested", "nested-a", { nested: true })
+    await waitFor("nested-a to hold", () => entered("nested-a"), 30)
+    const waiter = await hold("nested", "nested-b")
+    await waits("e2e-nested", waiter)
+    await open("nested-a")
+    await waitFor("nested-b to hold", () => entered("nested-b"), 30)
+    await open("nested-b")
+    for (const holder of [nested, waiter]) assert.equal((await outcome(holder)).status, 200)
+    assert.equal(await idle("e2e-nested"), 2)
+    // The nested withPermit sent nothing: it ran under the permit already held.
+    assert.deepEqual(await sentBy(nested), { acquire: 1, release: 1 })
+  })
 })
