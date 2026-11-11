@@ -4,16 +4,12 @@
  * concurrency limit. A semaphore is a description; its permits live in Restate, in a virtual object
  * that the app names and registers, made by `service`.
  *
- * Known limitation: durable cleanup around `withPermit` (`Effect.ensuring`, `Effect.onExit`,
- * `Effect.acquireRelease`) is not replay-safe after a defect that may not repeat: the retry's
- * journal no longer matches (error 570). Use `Restate.onError` for durable cleanup.
+ * Built only on the public API of `@t0ster/restate-effect` (`Restate.ensuring`, awakeables,
+ * one-way sends, `Restate.cancel`, state).
  */
-import { Context, Duration, Effect, Exit, Layer, Schema } from "effect"
-import { isFinal } from "./durable.js"
-import { Invocation, type InvocationState } from "./invocation.js"
-import { awakeable } from "./operations.js"
-import { make as makeService, send, sendNow } from "./semaphores.js"
-import type { Endpoint } from "./server.js"
+import { Context, Duration, Effect, Layer, Schema } from "effect"
+import { Restate } from "@t0ster/restate-effect"
+import { clientOf, layer as objectLayer } from "./object.js"
 
 declare const RegisteredId: unique symbol
 /**
@@ -42,7 +38,7 @@ export interface Service<N extends string = any> {
    * Implements the object: registers it with the endpoint, like a `toLayer` Layer, and provides
    * `Registered<N>`. Provide it to the implementation Layers whose handlers use `withPermit`.
    */
-  readonly layer: Layer.Layer<Registered<N>, never, Endpoint>
+  readonly layer: Layer.Layer<Registered<N>, never, Restate.Endpoint>
   /**
    * Provides `Registered<N>` without serving the object, for a deployment that uses permits of an
    * object that another deployment of the cluster registers.
@@ -55,16 +51,15 @@ export interface Service<N extends string = any> {
  * with it (see `make`) keeps its permits there.
  *
  * ```ts
- * export const Semaphores = Restate.Semaphore.service("app.Semaphores")
+ * export const Semaphores = Semaphore.service("app.Semaphores")
  * // in the endpoint: handlers that use withPermit require it
  * GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp))
  * ```
  */
 export const service = <const N extends string>(name: N): Service<N> => {
-  const { contract, layer } = makeService(name)
   const registered = Context.Service<Registered<N>, N>(`restate-effect/Semaphore/Registered/${name}`)
   const layerRemote = Layer.succeed(registered, name)
-  return Object.freeze({ name: contract.name, registered, layer: Layer.merge(layer, layerRemote), layerRemote })
+  return Object.freeze({ name, registered, layer: Layer.merge(objectLayer(name), layerRemote), layerRemote })
 }
 
 /**
@@ -95,7 +90,7 @@ export interface Semaphore<N extends string = any> {
  * (1 and 10 minutes): a stuck attempt is retried, keeping its permit, before the lease passes.
  */
 export const make = <N extends string>(service: Service<N>, name: string, permits: number, options?: { readonly lease?: Duration.Input }): Semaphore<N> => {
-  if (typeof service?.name !== "string" || !Context.isKey((service as Partial<Service>).registered)) throw new Error("Restate.Semaphore.make needs a service from Restate.Semaphore.service")
+  if (typeof service?.name !== "string" || !Context.isKey((service as Partial<Service>).registered)) throw new Error("Semaphore.make needs a service from Semaphore.service")
   if (!name) throw new Error("A Restate semaphore needs a nonempty name")
   if (!Number.isSafeInteger(permits) || permits < 1) throw new Error(`Semaphore ${name}: permits must be a positive integer, got ${permits}`)
   const lease = Duration.fromInputUnsafe(options?.lease ?? "15 minutes")
@@ -103,44 +98,35 @@ export const make = <N extends string>(service: Service<N>, name: string, permit
   return Object.freeze({ service, name, permits, lease })
 }
 
-/** The semaphores each attempt holds a permit of, so that a nested `withPermit` runs under it. */
-const holding = new WeakMap<InvocationState, Set<string>>()
+/** The semaphores whose permit the current fiber runs under, so that a nested `withPermit` runs under it. */
+const Held = Context.Reference<ReadonlySet<string>>("@t0ster/restate-effect/semaphore/Held", { defaultValue: () => new Set() })
 
-const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Invocation | Registered<any>> =>
-  Effect.andThen(self.service.registered, Effect.flatMap(Invocation, invocation => {
-    let held = holding.get(invocation)
-    if (held === undefined) holding.set(invocation, held = new Set())
+const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | Registered<any>> =>
+  Effect.gen(function* () {
+    yield* self.service.registered
     const id = `${self.service.name}/${self.name}`
-    if (held.has(id)) return effect
-    const names = held
-    const service = self.service.name
-    const holder = invocation.ctx.request().id
+    const held = yield* Held
+    if (held.has(id)) return yield* effect
+    const semaphore = clientOf(self.service.name).key(self.name)
+    const holder = yield* Restate.currentInvocationId
     const acquire = Effect.gen(function* () {
-      // A caught defect's release, still deferred, goes first.
-      invocation.flush(`semaphore:${id}`)
-      const granted = yield* awakeable(Schema.Void)
-      yield* send(service, self.name, "acquire", {
+      const granted = yield* Restate.awakeable(Schema.Void)
+      // One way, without awaiting the send's invocation ID.
+      yield* Restate.fork(semaphore.acquire({
         holder, awakeable: granted.id, permits: self.permits, lease: Math.ceil(Duration.toMillis(self.lease))
-      })
+      }, { discard: true }))
       yield* granted.promise
-      names.add(id)
     })
-    const release = send(service, self.name, "release", { holder }).pipe(
+    // Not awaited, so it works after Effect.timeout interrupted a durable operation that is still pending.
+    const release = Restate.fork(semaphore.release({ holder }, { discard: true })).pipe(
       // A release that cannot be sent leaves the permit held until the lease passes: never silently.
       Effect.tapCause(cause => Effect.logError(`Restate.Semaphore ${self.name}: could not release the permit`, cause))
     )
-    return Effect.onExit(Effect.andThen(acquire, effect), exit => Effect.suspend(() => {
-      names.delete(id)
-      if (Exit.isSuccess(exit) || isFinal(invocation, exit.cause)) return release
-      // A defect that only ends the attempt when it ends the handler: it may yet be caught, as by
-      // Effect.catchDefect. Release when the handler ends for good (or before taking the permit
-      // again); if only the attempt ends, its retry keeps the permit.
-      if (!invocation.ctx.request().attemptCompletedSignal.aborted) {
-        invocation.defer(`semaphore:${id}`, () => { sendNow(invocation, service, self.name, "release", { holder }) })
-      }
-      return Effect.void
-    }))
-  }))
+    // The key: after a caught defect, the deferred release goes before the next acquire of this semaphore.
+    return yield* Effect.andThen(acquire, Effect.provideService(effect, Held, new Set([...held, id]))).pipe(
+      Restate.ensuring(release, { key: `semaphore:${id}` })
+    )
+  })
 
 /**
  * Runs `effect` holding one permit, inside a handler of an implementation Layer that is provided
@@ -153,8 +139,8 @@ const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): 
  * nested `withPermit` of the same semaphore runs under it. A killed invocation keeps its permit
  * until the lease passes (see `make`).
  *
- * Durable cleanup around it (`Effect.ensuring`, `Effect.onExit`, `Effect.acquireRelease`) is not
- * replay-safe after a defect that may not repeat: use `Restate.onError`.
+ * Durable cleanup around it with `Effect.ensuring`, `Effect.onExit` or `Effect.acquireRelease` is
+ * not replay-safe after a defect that may not repeat: use `Restate.ensuring` or `Restate.onError`.
  *
  * Do not bound it with `Effect.timeout` or `Effect.race`: the permit is released, but the
  * interrupted durable operation stays pending, so the invocation cannot await another durable
@@ -163,7 +149,7 @@ const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): 
  * `Restate.sleep` with `Restate.raceAll`.
  */
 export const withPermit: {
-  <S extends Semaphore<any>>(self: S): <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Invocation | RegisteredOf<S>>
-  <S extends Semaphore<any>, A, E, R>(self: S, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Invocation | RegisteredOf<S>>
+  <S extends Semaphore<any>>(self: S): <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
+  <S extends Semaphore<any>, A, E, R>(self: S, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
 } = ((self: Semaphore<any>, effect?: Effect.Effect<any, any, any>) =>
   effect === undefined ? (effect: Effect.Effect<any, any, any>) => permit(self, effect) : permit(self, effect)) as any

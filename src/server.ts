@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Exit, Layer, Logger, Option } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Logger, Option, Scope } from "effect"
 import { Headers, HttpEffect, HttpRouter, HttpTraceContext } from "effect/http"
 import * as sdk from "@restatedev/restate-sdk"
 import * as fetchSdk from "@restatedev/restate-sdk/fetch"
@@ -27,17 +27,20 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
       const onDefect = own.onDefect ?? shared.onDefect ?? "pause"
       const runRetry = { ...shared.runRetry, ...defined(own.runRetry ?? {}) }
       const execute = async (ctx: sdk.Context, input: unknown) => {
-        const invocation = invocationState(ctx, stateful, stateful && handler.mode !== "shared", onDefect, runRetry)
+        const { api, state: invocation } = invocationState(ctx, stateful, stateful && handler.mode !== "shared", onDefect, runRetry)
         let context = Context.add(
-          Context.add(services, Invocation, invocation),
+          Context.add(services, Invocation, api),
           Transport, invocationTransport(ctx, invocation.execute)
         )
-        if (invocation.stateful) context = Context.add(Context.add(context, StateReader, invocation), Keyed, invocation)
-        if (invocation.writable) context = Context.add(context, StateWriter, invocation)
+        if (invocation.stateful) context = Context.add(Context.add(context, StateReader, api), Keyed, api)
+        if (invocation.writable) context = Context.add(context, StateWriter, api)
         context = Context.add(context, Logger.CurrentLoggers, new Set([restateLogger(ctx)]))
         const request = ctx.request()
         // A server span per handler, continuing Restate's trace when it sends one.
         const program = Effect.scoped(Effect.suspend(() => bound.handlers[method](input))).pipe(
+          // The invocation's finalizers (Restate.addFinalizer, deferred Restate.ensuring cleanups)
+          // run when it ends for good; if only the attempt ends, the retry registers them again.
+          Effect.onExit(exit => Exit.isSuccess(exit) || isFinal(invocation, exit.cause) ? Scope.close(invocation.scope, exit) : Effect.void),
           Effect.withSpan(`${contract.name}/${method}`, {
             kind: "server",
             parent: parentSpan(request),
@@ -46,8 +49,6 @@ export function definition<N extends string, H extends Handlers, K extends Kind>
         )
         const signal = request.attemptCompletedSignal
         const exit = await Effect.runPromiseExitWith(context)(program, { signal })
-        // Deferred work (a caught defect's release) runs when the handler ends for good, not when only the attempt does.
-        if (!signal.aborted && (Exit.isSuccess(exit) || isFinal(invocation, exit.cause))) invocation.flush()
         if (Exit.isFailure(exit) && !signal.aborted) {
           // Interrupted, not by the end of the attempt: cancelled, so the invocation ends as cancelled.
           if (Cause.hasInterruptsOnly(exit.cause)) throw new sdk.CancelledError()
