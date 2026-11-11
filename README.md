@@ -82,41 +82,91 @@ Handler dependencies become requirements of the implementation Layer, provided o
 - **External writes still need idempotency keys.** A crash before a step's result is stored can cause it to run again.
 - Use `Restate.now` and `Restate.sleep` for replay-safe time. Ordinary clocks, randomness and I/O outside `run` are not replay-safe.
 - Use `Restate.all`, `Restate.raceAll` and `Restate.fork` for durable concurrency. Ordinary Effect concurrency over durable operations (`Effect.all` with concurrency, `Effect.forkChild`) fails at runtime with a defect.
-- **For a durable timeout, race against `Restate.sleep`:** `Restate.raceAll([operation, Restate.map(() => null)(Restate.sleep("30 seconds"))])`. `Effect.timeout`, `Effect.race` and other Effect interruption of a pending durable operation run on wall-clock time, so they are not replay-safe: the interrupted Effect ends and its finalizers run, and one-way commands still work (so `withPermit` still releases its permit), but awaiting any other durable operation fails with a defect until the interrupted one settles.
+- **For a durable timeout, race against `Restate.sleep`:** `Restate.raceAll([operation, Restate.map(() => null)(Restate.sleep("30 seconds"))])`. `Effect.timeout`, `Effect.race` and other Effect interruption of a pending durable operation run on wall-clock time, so they are not replay-safe: the interrupted Effect ends and its finalizers run, and commands that are not awaited still work (one-way sends through `Restate.fork`, state writes, `Restate.resolveAwakeable`, `Restate.cancel`), but awaiting any other durable operation fails with a defect until the interrupted one settles.
 - Declared handler errors are final, typed failures; Restate does not retry them. By default, defects are retried, then the invocation pauses for an operator to fix and resume. Set `onDefect: "fail"` to fail immediately instead.
-- Use `Restate.onError` for durable cleanup on final failure or cancellation. Ordinary Effect finalizers run whenever an attempt ends, including retries.
+- Ordinary Effect finalizers run whenever an attempt ends, including retries and suspensions. For durable cleanup, use `Restate.ensuring`, `Restate.addFinalizer` or `Restate.onError` (see below).
+- `client.method(input, { discard: true })` starts a handler one way. Inside a handler it is a durable operation: `yield*` it for the invocation ID, or issue it with `Restate.fork` without awaiting anything. `Restate.cancel(invocationId)` cancels an invocation.
 
-The [example](example/app.ts) shows these patterns, including step retries, delayed calls and waiting for workflow results. Signals, workflow durable promises and explicit cancellation APIs are not wrapped; the raw SDK context is available as `Restate.Invocation`.
+The [example](example/app.ts) shows these patterns, including step retries, delayed calls and waiting for workflow results. Signals and workflow durable promises are not wrapped; `yield* Restate.Invocation` gives the raw SDK context as `ctx`.
+
+## Durable cleanup
+
+An attempt ends more often than the invocation does: a suspension, a retry after a defect or a pause end only the attempt, and the next attempt replays the handler from its journal. Effect's own finalizers (`Effect.ensuring`, `onExit`, `acquireRelease`) run at the end of every attempt, so durable steps or calls in them are journaled by some attempts but not others; a retry that takes another path then fails with a journal mismatch (570). Three combinators run cleanup only when it is final:
+
+```ts
+// Like Effect.ensuring: release when the work succeeds, fails for good, or is interrupted or cancelled.
+const booked = reserve(seat).pipe(
+  Restate.ensuring(Restate.fork(Seats.client.key(seat).unlock(undefined, { discard: true })))
+)
+
+// When the invocation ends for good, with its Exit.
+yield* Restate.addFinalizer(exit => notifyDone(exit))
+
+// Only when the invocation fails for good or is cancelled, with its Cause.
+const order = placeOrder.pipe(Restate.onError(cause => refund(cause)))
+```
+
+- **`Restate.ensuring(self, cleanup, options?)`** runs `cleanup` when `self` succeeds, fails for good (a declared failure, or a defect with `onDefect: "fail"`), or is interrupted (`Effect.timeout`) or cancelled. After a defect that may only end the attempt (the default `onDefect: "pause"`), the cleanup waits for the end of the invocation, so it runs if the defect is caught around it, and not at all if only the attempt ends: the retry runs `self` again and the cleanup after it. With `{ key }`, a later `ensuring` with the same key runs such a waiting cleanup before its own `self`, as a lock released before it is taken again.
+- **`Restate.addFinalizer(exit => cleanup)`** runs when the invocation ends for good: success, final failure, cancellation. Never when only the attempt ends; each attempt registers it again as it replays. Like `Workflow.addFinalizer` in Effect's workflow module.
+- **`Restate.onError(cleanup)`** runs only on a final failure or cancellation of the Effect it wraps.
+- Cleanup runs uninterruptibly and can make durable calls and steps. A defect in it fails the handler as a defect. Cleanups that wait for the end of the invocation run after the handler's own scope has closed, with the services of where they were registered: do not use the handler's scoped resources in them.
+- After `Effect.timeout` interrupted a durable operation, that operation stays pending, so cleanup cannot await another until it settles: issue one-way sends with `Restate.fork(client.method(input, { discard: true }))`.
+- A killed invocation runs no cleanup at all.
 
 ## Concurrency limits
 
-`Restate.Semaphore` caps how many invocations do something at once, across every handler and process, such as calls to an API that allows four in flight. Its permits live in a virtual object that your app names and registers, like any other service:
+`Semaphore`, from the `@t0ster/restate-effect/semaphore` subpath, caps how many invocations do something at once, across every handler and process, such as calls to an API that allows four in flight. It is built only on the public API above (`Restate.ensuring`, awakeables, one-way sends, `Restate.cancel`, state). Its permits live in a virtual object that your app names and registers, like any other service:
 
 ```ts
+import { Semaphore } from "@t0ster/restate-effect/semaphore"
+
 // Shared, like a contract: the object that keeps the app's semaphores.
-export const Semaphores = Restate.Semaphore.service("my-app.Semaphores")
+export const Semaphores = Semaphore.service("my-app.Semaphores")
 
 // The endpoint: register it once, provided to the implementation Layers whose handlers use permits.
 GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp) /* , … */)
 
-const gateway = Restate.Semaphore.make(Semaphores, "llm-gateway", 4)
+const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
 
 // Inside handlers: at most 4 of these steps run at once.
 const complete = (prompt: string) =>
   Restate.run("complete", callGateway(prompt), { success: Schema.String, error: GatewayError }).pipe(
-    Restate.Semaphore.withPermit(gateway)
+    Semaphore.withPermit(gateway)
   )
 ```
 
-- **A semaphore is a description; its permits live in Restate.** `Restate.Semaphore.service(name)` describes the virtual object that keeps the permits, with its implementation as `.layer`. Its handlers are internal (and ingress-private): only `withPermit` calls them. One object holds any number of semaphores, one key each; within an object, a semaphore's name is unique: everything that uses the name shares its permits.
+- **A semaphore is a description; its permits live in Restate.** `Semaphore.service(name)` describes the virtual object that keeps the permits, with its implementation as `.layer`. Its handlers are internal (and ingress-private): only `withPermit` calls them. One object holds any number of semaphores, one key each; within an object, a semaphore's name is unique: everything that uses the name shares its permits.
 - **A forgotten registration is a type error.** `withPermit` requires `Registered<"my-app.Semaphores">`, which only `Semaphores.layer` provides, so handlers that use permits leave it in their Layer's requirements until it is provided. A deployment that uses an object another deployment registers provides `Semaphores.layerRemote` instead. If no deployment registers it after all, Restate rejects `withPermit`'s first send: the attempt fails with `RT0018` ("the service handler … was not found") and is retried per the handler's retry policy, then paused or failed once its attempts run out (`onDefect`).
 - **Waiting is durable and first in, first out.** A waiting invocation suspends, holding nothing.
-- **The permit is released when the effect succeeds, fails for good, is cancelled or interrupted**, as `Restate.onError` runs, including while it still waits. After a defect caught around it (`Effect.catchDefect`, `Effect.exit`, …), the permit is released when the handler ends with success or a final failure, or at the next `withPermit` of the same semaphore; an uncaught defect only ends the attempt, so the retry keeps the permit.
-- **Durable cleanup around `withPermit` (`Effect.ensuring`, `onExit`, `acquireRelease`) is not replay-safe after a defect that may not repeat; use `Restate.onError`.** If a defect from plain code (outside `Restate.run`) ends one attempt but not its retry, the finalizer's durable steps in the dead attempt do not match the retry's journal: the retry fails with a journal mismatch (570) until the invocation pauses, holding its permit until the lease passes.
+- **The permit is released as `Restate.ensuring` runs its cleanup** (`withPermit` is built on it, keyed by the semaphore): when the effect succeeds, fails for good, is cancelled or interrupted, including while it still waits. After a defect caught around it (`Effect.catchDefect`, `Effect.exit`, …), the permit is released when the invocation ends, or at the next `withPermit` of the same semaphore; an uncaught defect only ends the attempt, so the retry keeps the permit.
+- **Durable cleanup around `withPermit` belongs in `Restate.ensuring` or `Restate.onError`**, not `Effect.ensuring`, `onExit` or `acquireRelease` (see [Durable cleanup](#durable-cleanup)).
 - **Do not bound `withPermit` with `Effect.timeout` or `Effect.race`.** The permit is released, but the invocation then cannot await further durable operations (they fail with a defect) until the interrupted one settles. For a durable timeout, race the durable operation against `Restate.sleep` with `Restate.raceAll`. The invocation holds the permit, so its retries and replays keep it, and a nested `withPermit` of the same semaphore runs under it.
 - **A lease bounds a lost permit.** A killed invocation never releases its permit: the semaphore reclaims a permit held longer than the lease, 15 minutes unless `make(service, name, permits, { lease })` sets it. A holder still running then loses its permit without knowing, so set the lease above the longest hold, retries and suspensions included. The lease cannot be renewed yet; a release cancels its lease's scheduled expiry.
-- **Wide types.** `Restate.Semaphore.Semaphore` and `Restate.Semaphore.Service` without a type argument accept any semaphore or object, for fields and helpers; `withPermit` of such a semaphore is satisfied by any object's Layer, so the check of which one is lost.
+- **Wide types.** `Semaphore.Semaphore` and `Semaphore.Service` without a type argument accept any semaphore or object, for fields and helpers; `withPermit` of such a semaphore is satisfied by any object's Layer, so the check of which one is lost.
 - **Limits.** Each semaphore is one virtual-object key, so its acquires and releases run one at a time: a few hundred per second at most. The app registers the object once; if several deployments register it, Restate routes it to the latest, so keep them on compatible library versions.
+
+### Migrating from 0.6
+
+0.7.0 moves the semaphore out of the root API, to the `@t0ster/restate-effect/semaphore` subpath, and rebuilds it on the public API. Its shape is unchanged:
+
+```diff
+-import { Restate } from "@t0ster/restate-effect"
+-export const Semaphores = Restate.Semaphore.service("my-app.Semaphores")
+-const gateway = Restate.Semaphore.make(Semaphores, "llm-gateway", 4)
+-effect.pipe(Restate.Semaphore.withPermit(gateway))
++import { Semaphore } from "@t0ster/restate-effect/semaphore"
++export const Semaphores = Semaphore.service("my-app.Semaphores")
++const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
++effect.pipe(Semaphore.withPermit(gateway))
+```
+
+The type `Restate.Semaphore.Semaphore<N>` becomes `Semaphore.Semaphore<N>`. The object's name, handlers, schemas and state, and the commands `withPermit` journals, are unchanged, so permits carry over and invocations that hold or wait for a permit under 0.6 resume under 0.7 (an end-to-end test upgrades an endpoint under them). One journal difference: when an invocation ends with releases still waiting after caught defects in several semaphores, 0.6 sent them in the order they were deferred and 0.7 sends them in reverse (scope order). It only matters if that last attempt, started under 0.6, fails after sending some of them and is retried under 0.7.
+
+Other changes in 0.7.0:
+
+- `Restate.Invocation` now gives only `{ ctx }`, the raw SDK context; the adapter's internals are no longer reachable.
+- `client.method(input, { discard: true })` returns a `Durable<InvocationId>` instead of an `Effect`: `yield*` still gives the invocation ID; `Restate.fork` and the other combinators accept it.
+- New: `Restate.ensuring`, `Restate.addFinalizer`, `Restate.cancel`.
 
 ### Migrating from 0.5
 

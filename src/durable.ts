@@ -2,7 +2,7 @@ import { Cause, Context, Effect, Effectable, Result } from "effect"
 import type { Pipeable } from "effect"
 import * as sdk from "@restatedev/restate-sdk"
 import { singleFailure } from "./codec.js"
-import { Invocation, type InvocationState } from "./invocation.js"
+import { Invocation, stateOf, type InvocationApi, type InvocationState } from "./invocation.js"
 import type { ClientError } from "./errors.js"
 import type { Transport } from "./client.js"
 
@@ -57,7 +57,7 @@ export const awaitPromise = <A, E>(promise: (signal: AbortSignal) => PromiseLike
  */
 export class Durable<A, E = never, R = Invocation> extends Effectable.Class<A, E, R> implements Pipeable.Pipeable {
   constructor(
-    readonly issue: (invocation: InvocationState, context: Context.Context<R>) => sdk.RestatePromise<A>,
+    readonly issue: (invocation: InvocationApi, context: Context.Context<R>) => sdk.RestatePromise<A>,
     /** How `yield*` runs it; by default it is issued and awaited inside a handler. */
     private readonly effect?: Effect.Effect<A, E, R>
   ) { super() }
@@ -66,7 +66,7 @@ export class Durable<A, E = never, R = Invocation> extends Effectable.Class<A, E
       Effect.context<R | Invocation>(),
       context => {
         const invocation = Context.get(context, Invocation)
-        return awaitPromise<A, E>(signal => invocation.execute(() => this.issue(invocation, context as Context.Context<R>), signal))
+        return awaitPromise<A, E>(signal => stateOf(invocation).execute(() => this.issue(invocation, context as Context.Context<R>), signal))
       }
     ) as Effect.Effect<A, E, R>
   }
@@ -137,7 +137,7 @@ export interface Fiber<A, E = never> {
 export const fork = <A, E, R>(self: Durable<A, E, R>): Effect.Effect<Fiber<A, Exclude<E, ClientError>>, never, Inside<R>> =>
   Effect.flatMap(Effect.context<Inside<R>>(), context => Effect.sync(() => {
     const invocation = Context.get(context, Invocation)
-    invocation.assertReady()
+    stateOf(invocation).assertReady()
     return { promise: self.issue(invocation, context as unknown as Context.Context<R>) }
   }))
 

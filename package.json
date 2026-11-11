@@ -23,6 +23,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./semaphore": {
+      "types": "./dist/semaphore/index.d.ts",
+      "import": "./dist/semaphore/index.js"
     }
   },
   "files": [

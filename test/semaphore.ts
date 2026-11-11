@@ -7,6 +7,7 @@ import { Effect, Layer, Schema } from "effect"
 import { HttpRouter } from "effect/http"
 import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Restate } from "@t0ster/restate-effect"
+import { Semaphore } from "@t0ster/restate-effect/semaphore"
 
 export class Refused extends Schema.Error<Refused>("Refused")({ _tag: Schema.tag("Refused") }) {}
 
@@ -14,26 +15,26 @@ export class Refused extends Schema.Error<Refused>("Refused")({ _tag: Schema.tag
 const prefix = process.env.PREFIX ?? "e2e"
 
 /** The app's semaphore object, registered below; and another, with a name of its own. */
-export const Semaphores = Restate.Semaphore.service(`${prefix}.Semaphores`)
-export const Limits = Restate.Semaphore.service(`${prefix}.app.Limits`)
+export const Semaphores = Semaphore.service(`${prefix}.Semaphores`)
+export const Limits = Semaphore.service(`${prefix}.app.Limits`)
 /** Never registered: `layerRemote` claims another deployment registers it, which none does. */
-const Unregistered = Restate.Semaphore.service(`${prefix}.Unregistered`)
+const Unregistered = Semaphore.service(`${prefix}.Unregistered`)
 
 // One semaphore per test, so that each starts empty.
 const semaphores = {
-  cap: Restate.Semaphore.make(Semaphores, "e2e-cap", 2),
-  fifo: Restate.Semaphore.make(Semaphores, "e2e-fifo", 1),
-  release: Restate.Semaphore.make(Semaphores, "e2e-release", 1),
-  queue: Restate.Semaphore.make(Semaphores, "e2e-queue", 1),
-  lease: Restate.Semaphore.make(Semaphores, "e2e-lease", 1, { lease: "3 seconds" }),
-  retry: Restate.Semaphore.make(Semaphores, "e2e-retry", 1),
-  nested: Restate.Semaphore.make(Semaphores, "e2e-nested", 1),
-  defect: Restate.Semaphore.make(Semaphores, "e2e-defect", 1),
-  ensure: Restate.Semaphore.make(Semaphores, "e2e-ensure", 1, { lease: "4 seconds" }),
-  timeout: Restate.Semaphore.make(Semaphores, "e2e-timeout", 1),
-  crash: Restate.Semaphore.make(Semaphores, "e2e-crash", 1),
-  named: Restate.Semaphore.make(Limits, "e2e-named", 1),
-  missing: Restate.Semaphore.make(Unregistered, "e2e-missing", 1)
+  cap: Semaphore.make(Semaphores, "e2e-cap", 2),
+  fifo: Semaphore.make(Semaphores, "e2e-fifo", 1),
+  release: Semaphore.make(Semaphores, "e2e-release", 1),
+  queue: Semaphore.make(Semaphores, "e2e-queue", 1),
+  lease: Semaphore.make(Semaphores, "e2e-lease", 1, { lease: "3 seconds" }),
+  retry: Semaphore.make(Semaphores, "e2e-retry", 1),
+  nested: Semaphore.make(Semaphores, "e2e-nested", 1),
+  defect: Semaphore.make(Semaphores, "e2e-defect", 1),
+  ensure: Semaphore.make(Semaphores, "e2e-ensure", 1, { lease: "4 seconds" }),
+  timeout: Semaphore.make(Semaphores, "e2e-timeout", 1),
+  crash: Semaphore.make(Semaphores, "e2e-crash", 1),
+  named: Semaphore.make(Limits, "e2e-named", 1),
+  missing: Semaphore.make(Unregistered, "e2e-missing", 1)
 }
 
 const Event = Schema.Struct({ id: Schema.String, event: Schema.Literals(["enter", "exit", "died"]), at: Schema.Number })
@@ -110,8 +111,8 @@ const hold = ({ semaphore, id, until, fail, flaky, nested, die, timeout }: typeo
     if (fail) return yield* new Refused()
     return id
   }).pipe(
-    effect => nested ? Restate.Semaphore.withPermit(semaphores[semaphore], effect) : effect,
-    Restate.Semaphore.withPermit(semaphores[semaphore]),
+    effect => nested ? Semaphore.withPermit(semaphores[semaphore], effect) : effect,
+    Semaphore.withPermit(semaphores[semaphore]),
     effect => die === "caught" ? Effect.catchDefect(effect, () => Effect.as(Restate.sleep(until === "opened" ? 0 : until), "caught")) : effect,
     effect => die === "uncaught" ? Effect.ensuring(effect, step("ensure", () => {})) : effect,
     effect => timeout === undefined ? effect : effect.pipe(

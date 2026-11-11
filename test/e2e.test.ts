@@ -1,6 +1,9 @@
 // End to end: serve the example under Node and under Bun, register it with a real Restate server,
 // and run the example client against it. Restate runs in Docker on the host network.
 import { type ChildProcess, spawn, spawnSync } from "node:child_process"
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join, resolve } from "node:path"
 import { after, before, describe, test } from "node:test"
 import assert from "node:assert/strict"
 
@@ -14,8 +17,8 @@ const restateEnv = {
 }
 
 /** A child process whose output is kept for assertions and failure reports. */
-const start = (command: string, args: ReadonlyArray<string>, env: Record<string, string> = {}) => {
-  const child = spawn(command, args, { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] })
+const start = (command: string, args: ReadonlyArray<string>, env: Record<string, string> = {}, cwd?: string) => {
+  const child = spawn(command, args, { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] })
   let output = ""
   child.stdout.on("data", chunk => { output += chunk })
   child.stderr.on("data", chunk => { output += chunk })
@@ -26,7 +29,10 @@ const start = (command: string, args: ReadonlyArray<string>, env: Record<string,
 const stop = async (process: { child: ChildProcess; exited: Promise<number | null> }) => {
   if (process.child.exitCode === null) process.child.kill("SIGINT")
   await Promise.race([process.exited, new Promise(resolve => setTimeout(resolve, 5000))])
-  if (process.child.exitCode === null) process.child.kill("SIGKILL")
+  if (process.child.exitCode === null && process.child.signalCode === null) {
+    process.child.kill("SIGKILL")
+    await process.exited
+  }
 }
 
 const waitFor = async (what: string, ready: () => Promise<boolean>, seconds = 60) => {
@@ -52,7 +58,8 @@ const register = async (port: number) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ uri: `http://127.0.0.1:${port}`, force: true })
   })
-  assert.equal(registration.status, 201, await registration.text())
+  // 201 for a new deployment; 200 when it replaces the one at this URI.
+  assert.ok(registration.status === 201 || registration.status === 200, `${registration.status}: ${await registration.text()}`)
 }
 
 let restate: ReturnType<typeof start>
@@ -149,6 +156,94 @@ void test("a retried failure's delay overrides the backoff", { timeout: 120_000 
   } finally {
     await stop(server)
   }
+})
+
+// Restate.ensuring, Restate.addFinalizer, one-way sends and Restate.cancel (fixture: test/cleanup.ts).
+void describe("durable cleanup", () => {
+  const port = 29185
+  let server: ReturnType<typeof start>
+  before(async () => {
+    server = start("node", ["test/cleanup.ts"], { PORT: String(port) })
+    await waitFor("the cleanup endpoint", async () => server.output().includes("Listening on"), 30)
+    await register(port)
+  })
+  after(() => stop(server))
+
+  const recorded = async (id: string) => await call("Cleanup/events", id) as ReadonlyArray<string>
+  /** What ran, without the attempts. */
+  const ran = async (id: string) => (await recorded(id)).filter(e => e !== "attempt")
+  const scenario = async (id: string, scenario: string, handler = "run") => {
+    const response = await fetch(`${ingress}/Cleanup/${handler}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, scenario })
+    })
+    return { status: response.status, body: await response.json() as unknown }
+  }
+  const started = async (id: string, scenario: string) => {
+    const response = await fetch(`${ingress}/Cleanup/run/send`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id, scenario })
+    })
+    assert.ok(response.ok)
+    return (await response.json() as { invocationId: string }).invocationId
+  }
+
+  void test("success: the cleanup runs after the effect, the finalizer at the end", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("success", "success"), { status: 200, body: "ok" })
+    assert.deepEqual(await ran("success"), ["body", "cleanup", "final:success"])
+  })
+
+  void test("a declared failure runs both", { timeout: 60_000 }, async () => {
+    const { status, body } = await scenario("failure", "failure")
+    assert.equal(status, 500)
+    assert.equal((body as { message: string }).message, "Refused")
+    assert.deepEqual(await ran("failure"), ["body", "cleanup", "final:failure"])
+  })
+
+  for (const how of ["admin API", "Restate.cancel"] as const) {
+    void test(`cancellation (${how}) runs both`, { timeout: 60_000 }, async () => {
+      const id = `cancelled-${how === "admin API" ? "admin" : "api"}`
+      const invocation = await started(id, "cancelled")
+      await waitFor("the body", async () => (await ran(id)).includes("body"), 30)
+      if (how === "admin API") {
+        const response = await fetch(`${admin}/invocations/${invocation}/cancel`, { method: "PATCH" })
+        assert.equal(response.status, 202)
+      } else {
+        await call("Cleanup/cancel", invocation)
+      }
+      const attached = await fetch(`${ingress}/restate/invocation/${invocation}/attach`)
+      assert.equal(attached.status, 409)
+      assert.deepEqual(await ran(id), ["body", "cleanup", "final:interrupted"])
+    })
+  }
+
+  void test("after a caught defect, the cleanup is deferred to the end of the invocation", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("caught", "caught"), { status: 200, body: "caught" })
+    assert.deepEqual(await ran("caught"), ["body", "after", "cleanup", "final:success"])
+  })
+
+  void test("when only the attempt ends, nothing runs; the retry runs them once", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("retried", "retried"), { status: 200, body: "retried" })
+    const events = await recorded("retried")
+    assert.ok(events.filter(e => e === "attempt").length >= 2, `retried: ${events.join(", ")}`)
+    assert.deepEqual(events.filter(e => e !== "attempt"), ["body", "cleanup", "final:success"])
+    // Nothing between the two attempts: the first attempt's deferred cleanup never ran.
+    assert.deepEqual(events.slice(0, 3), ["attempt", "body", "attempt"])
+  })
+
+  void test("a defect with onDefect: \"fail\" runs both at once", { timeout: 60_000 }, async () => {
+    assert.equal((await scenario("crash", "crash", "crash")).status, 500)
+    assert.deepEqual(await ran("crash"), ["body", "cleanup", "final:failure"])
+  })
+
+  void test("a later ensuring with the same key runs the deferred cleanup before its body", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("keyed", "keyed"), { status: 200, body: "keyed" })
+    assert.deepEqual(await ran("keyed"), ["first", "between", "cleanup:first", "second", "cleanup:second", "final:success"])
+  })
+
+  void test("a one-way send through Restate.fork goes out after Effect.timeout", { timeout: 60_000 }, async () => {
+    assert.deepEqual(await scenario("timeout", "timeout"), { status: 200, body: "timed out" })
+    await waitFor("the send", async () => (await ran("timeout")).includes("sent"), 30)
+    assert.deepEqual(await ran("timeout"), ["sent"])
+  })
 })
 
 // Restate.Semaphore (fixture: test/semaphore.ts). Holders hold a permit until the test opens their
@@ -451,3 +546,84 @@ const semaphoreTests = (runtime: "node" | "bun", port: number) => describe(`Rest
 })
 void semaphoreTests("node", 29183)
 void semaphoreTests("bun", 29184)
+
+// Upgrading from 0.6: invocations that hold or wait for a permit under 0.6 (Restate.Semaphore)
+// replay under 0.7 (the semaphore subpath) when the endpoint at the same URI is upgraded.
+void test("permits and in-flight invocations carry over from 0.6", { timeout: 180_000 }, async () => {
+  const port = 29186
+  const prefix = "e2e-compat"
+  const holders = `${prefix}.Holders`
+  // v0.6.0's sources and fixture, built with this checkout's dependencies.
+  const old = mkdtempSync(join(tmpdir(), "restate-effect-0.6-"))
+  try {
+    const archive = spawnSync("sh", ["-c", `git archive v0.6.0 | tar -x -C '${old}'`], { encoding: "utf8" })
+    assert.equal(archive.status, 0, archive.stderr)
+    symlinkSync(resolve("node_modules"), join(old, "node_modules"))
+    const build = spawnSync("bun", ["run", "build"], { cwd: old, encoding: "utf8" })
+    assert.equal(build.status, 0, build.stdout + build.stderr)
+
+    const serve = async (cwd: string | undefined) => {
+      const server = start("node", ["test/semaphore.ts"], { PORT: String(port), PREFIX: prefix }, cwd)
+      try {
+        await waitFor("the semaphore endpoint", async () => server.output().includes("Listening on"), 30)
+        await register(port)
+      } catch (error) {
+        await stop(server)
+        throw new Error(`${String(error)}\n${server.output()}`)
+      }
+      return server
+    }
+    /** Holds the permit for `until` milliseconds, a durable sleep. */
+    const hold = async (id: string, until: number) => {
+      const response = await fetch(`${ingress}/${holders}/hold/send`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore: "fifo", id, until })
+      })
+      assert.ok(response.ok)
+      return (await response.json() as { invocationId: string }).invocationId
+    }
+    const stateOf = async () => {
+      const response = await fetch(`${admin}/query`, {
+        method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ query: `SELECT key, value_utf8 FROM state WHERE service_name = '${prefix}.Semaphores' AND service_key = 'e2e-fifo'` })
+      })
+      const rows = (await response.json() as { rows: ReadonlyArray<{ key: string; value_utf8: string }> }).rows
+      const ledger = rows.find(r => r.key === "ledger")
+      return {
+        holders: ledger ? (JSON.parse(ledger.value_utf8) as { holders: ReadonlyArray<{ holder: string }> }).holders.map(h => h.holder) : [],
+        waiting: rows.filter(r => r.key.startsWith("waiter:")).map(r => (JSON.parse(r.value_utf8) as { holder: string }).holder)
+      }
+    }
+    const outcome = async (id: string) => (await fetch(`${ingress}/restate/invocation/${id}/attach`)).status
+
+    // Under 0.6: a holds the permit, sleeping for 10 seconds; b waits for it; both suspend.
+    let server = await serve(old)
+    let a: string, b: string
+    try {
+      a = await hold("compat-a", 10_000)
+      await waitFor("compat-a to hold", async () => (await stateOf()).holders.includes(a), 30)
+      b = await hold("compat-b", 300)
+      await waitFor("compat-b to wait", async () => (await stateOf()).waiting.includes(b), 30)
+    } finally {
+      await stop(server)
+    }
+
+    // Under 0.7: a resumes, replaying its 0.6 journal, and releases; b gets the permit.
+    server = await serve(undefined)
+    try {
+      assert.equal(await outcome(a), 200, server.output())
+      assert.equal(await outcome(b), 200, server.output())
+      // a entered under 0.6 and left under 0.7 (its replay did not enter again); b did both under 0.7.
+      const events = (await call(`${holders}/events`, null) as ReadonlyArray<{ id: string; event: string }>).filter(e => e.id.startsWith("compat-"))
+      assert.deepEqual(events.map(e => `${e.id}:${e.event}`), ["compat-a:exit", "compat-b:enter", "compat-b:exit"])
+      await waitFor("the semaphore to be idle", async () => {
+        const { holders, waiting } = await stateOf()
+        return holders.length === 0 && waiting.length === 0
+      }, 30)
+      assert.doesNotMatch(server.output(), /journal mismatch|RT0016|570/i)
+    } finally {
+      await stop(server)
+    }
+  } finally {
+    rmSync(old, { recursive: true, force: true })
+  }
+})

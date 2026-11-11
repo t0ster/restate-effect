@@ -6,7 +6,7 @@ import { cachedSerde, decodeFailure } from "./codec.js"
 import type { AnyContract, Handler, Handlers } from "./contract.js"
 import { millis } from "./duration.js"
 import { Durable, decodeRejection, isCancellation } from "./durable.js"
-import type { InvocationState } from "./invocation.js"
+import type { InvocationApi } from "./invocation.js"
 import { ClientError } from "./errors.js"
 
 /** A Restate invocation ID: a branded string, so it can be stored, sent and decoded like any value. */
@@ -17,7 +17,11 @@ export interface CallOptions {
   readonly idempotencyKey?: string
   readonly headers?: Record<string, string>
 }
-/** A one-way call: returns the invocation ID once Restate accepted it, without waiting for the result. */
+/**
+ * A one-way call: returns the invocation ID once Restate accepted it, without waiting for the result.
+ * Inside a handler it is a `Durable`, so `Restate.fork` issues it without awaiting even the ID: a
+ * send that works while an operation interrupted by Effect (as by `Effect.timeout`) is pending.
+ */
 export interface SendOptions extends CallOptions {
   readonly discard: true
   /** Restate delivers the call after this delay. */
@@ -47,7 +51,7 @@ type Err<H extends Handler> = H["error"]["Type"]
  * with the handler's declared errors or `E`, the client's transport error.
  */
 export interface Method<H extends Handler, E = ClientError, R = Transport> {
-  (input: In<H>, options: SendOptions): Effect.Effect<InvocationId, E, R>
+  (input: In<H>, options: SendOptions): Durable<InvocationId, E, R>
   (input: In<H>, options?: CallOptions): Durable<Out<H>, Err<H> | E, R>
 }
 type Methods<H extends Handlers, E, R> = { readonly [K in keyof H]: Method<H[K], E, R> }
@@ -99,12 +103,23 @@ function perform(transport: Context.Service.Shape<typeof Transport>, call: Call)
  * The combinator path, inside a handler: issues the command; rejections follow the Durable
  * protocol. A callee's undeclared failure is a remote defect, so it rejects as is and dies.
  */
-function issue(invocation: InvocationState, call: Call): sdk.RestatePromise<unknown> {
+function issue(invocation: InvocationApi, call: Call): sdk.RestatePromise<unknown> {
   return decodeRejection(command(invocation.ctx, call), failure => decodeFailure(failure, call.handler.error))
 }
 
-/** The SDK command for a call or attach. A workflow's run is called directly here: it does not join. */
+/** A one-way call's command: issued at once; its promise is the invocation ID, which Restate assigns. */
+function sendCommand(ctx: sdk.Context, call: Call): sdk.RestatePromise<InvocationId> {
+  return ctx.genericSend({
+    service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
+    inputSerde: cachedSerde(call.handler.input), delay: millis(call.options?.delay),
+    idempotencyKey: call.options?.idempotencyKey, headers: call.options?.headers
+  // The SDK types it as a Promise; it is a RestatePromise, which the combinators need.
+  }).invocationId as unknown as sdk.RestatePromise<InvocationId>
+}
+
+/** The SDK command for a call, send or attach. A workflow's run is called directly here: it does not join. */
 function command(ctx: sdk.Context, call: Call): sdk.RestatePromise<unknown> {
+  if (call.operation === "send") return sendCommand(ctx, call)
   if (call.operation === "attach") return ctx.invocation(call.invocationId as unknown as sdk.InvocationId).attach(cachedSerde(call.handler.success))
   return ctx.genericCall({
     service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
@@ -122,7 +137,8 @@ function build(contract: AnyContract, run: Run): any {
     (input: unknown, options?: CallOptions & { readonly discard?: boolean; readonly delay?: Duration.Input }) => {
       if (options?.discard) {
         const { discard: _, ...rest } = options
-        return Effect.map(run({ contract, method, handler, input, key, options: rest, operation: "send" }), id => id as InvocationId)
+        const send: Call = { contract, method, handler, input, key, options: rest, operation: "send" }
+        return new Durable<unknown, unknown, any>(invocation => issue(invocation, send), run(send))
       }
       const call: Call = { contract, method, handler, input, key, options, operation: "call" }
       return new Durable<unknown, unknown, any>(invocation => issue(invocation, call), run(call))
@@ -200,11 +216,7 @@ export const invocationTransport = (
 ): Context.Service.Shape<typeof Transport> => ({
   call: call => Effect.tryPromise({
     try: signal => execute(async () => {
-      const send = () => ctx.genericSend({
-        service: call.contract.name, method: call.method, key: call.key, parameter: call.input,
-        inputSerde: cachedSerde(call.handler.input), delay: millis(call.options?.delay),
-        idempotencyKey: call.options?.idempotencyKey, headers: call.options?.headers
-      }).invocationId
+      const send = () => sendCommand(ctx, call)
       if (call.operation === "send") return send()
       // A workflow runs once per key: send (which joins a started run), then attach to it.
       if (isWorkflowRun(call)) return command(ctx, { ...call, operation: "attach", invocationId: await send() as unknown as InvocationId })
