@@ -1,7 +1,9 @@
 import { Effect, Schema } from "effect"
+import type * as sdk from "@restatedev/restate-sdk"
+import { awaitPromise } from "./durable.js"
 import { cachedSerde } from "./codec.js"
 import { handler, object } from "./contract.js"
-import { Invocation } from "./invocation.js"
+import { Invocation, type InvocationState } from "./invocation.js"
 import { key, resolveAwakeable, state } from "./operations.js"
 
 /*
@@ -36,23 +38,32 @@ export const Semaphores = object("_restate-effect.Semaphores", {
 type Methods = typeof Semaphores.handlers
 /**
  * Sends `input` to the semaphore `name`, one way, without waiting for Restate to accept it (see
- * above). With `delay` (milliseconds), Restate delivers it that much later.
+ * above). With `delay` (milliseconds), Restate delivers it that much later. Returns the handle.
  */
-export const send = <M extends keyof Methods>(name: string, method: M, input: Methods[M]["input"]["Type"], delay?: number): Effect.Effect<void, never, Invocation> =>
-  Effect.flatMap(Invocation, invocation => Effect.sync(() => {
-    invocation.assertReady()
-    invocation.ctx.genericSend({
-      service: Semaphores.name, method, key: name, parameter: input,
-      inputSerde: cachedSerde(Semaphores.handlers[method].input as Methods[M]["input"]), delay
-    })
-  }))
+export const sendNow = <M extends keyof Methods>(invocation: InvocationState, name: string, method: M, input: Methods[M]["input"]["Type"], delay?: number): sdk.InvocationHandle => {
+  invocation.assertReady()
+  return issueSend(invocation, name, method, input, delay)
+}
+/** `sendNow` without the readiness check, for inside `execute`, which made it. */
+const issueSend = <M extends keyof Methods>(invocation: InvocationState, name: string, method: M, input: Methods[M]["input"]["Type"], delay?: number): sdk.InvocationHandle =>
+  invocation.ctx.genericSend({
+    service: Semaphores.name, method, key: name, parameter: input,
+    inputSerde: cachedSerde(Semaphores.handlers[method].input as Methods[M]["input"]), delay
+  })
+export const send = <M extends keyof Methods>(name: string, method: M, input: Methods[M]["input"]["Type"]): Effect.Effect<void, never, Invocation> =>
+  Effect.flatMap(Invocation, invocation => Effect.sync(() => { sendNow(invocation, name, method, input) }))
 
 /*
  * State: the ledger, small and rewritten by every change, and the queue's waiters, one key each,
  * so joining or leaving even a long queue writes only that waiter's keys: `waiter:<place>`, and
  * `place:<holder>` to find a waiter that leaves.
  */
-const Holder = Schema.Struct({ holder: Schema.String, grant: Schema.Number })
+const Holder = Schema.Struct({
+  holder: Schema.String,
+  grant: Schema.Number,
+  /** The invocation ID of this grant's `expire`, cancelled once the grant ends (absent in 0.4.0 ledgers). */
+  expire: Schema.optional(Schema.String)
+})
 const Ledger = Schema.Struct({
   /** The latest acquire's. */
   permits: Schema.Number,
@@ -81,11 +92,20 @@ const save = (ledger: Ledger) => state.set("ledger", Ledger, ledger)
 
 const grantTo = Effect.fnUntraced(function* (ledger: Ledger, waiter: Waiter) {
   const grant = ++ledger.grants
-  ledger.holders.push({ holder: waiter.holder, grant })
   // Unless this grant is released by then, `expire` reclaims it.
-  yield* send(yield* key, "expire", { holder: waiter.holder, grant }, waiter.lease)
+  const name = yield* key
+  const expire = yield* Effect.flatMap(Invocation, invocation => awaitPromise<string, never>(signal =>
+    invocation.execute(() => issueSend(invocation, name, "expire", { holder: waiter.holder, grant }, waiter.lease).invocationId, signal)))
+  ledger.holders.push({ holder: waiter.holder, grant, expire })
   yield* resolveAwakeable(waiter.awakeable, Schema.Void, undefined)
 })
+
+/** Ends a grant other than by its `expire`: cancels that, so it does not linger, scheduled, for the lease. */
+const cancelExpire = (holder: typeof Holder.Type) => Effect.flatMap(Invocation, invocation => Effect.sync(() => {
+  if (holder.expire === undefined) return
+  invocation.assertReady()
+  invocation.ctx.cancel(holder.expire as sdk.InvocationId)
+}))
 
 /** Grants free permits to the queue, first in, first out. */
 const fill = Effect.fnUntraced(function* (ledger: Ledger) {
@@ -130,7 +150,8 @@ export const SemaphoresLive = Semaphores.toLayer({
     const ledger = yield* load
     const index = ledger.holders.findIndex(h => h.holder === holder)
     if (index >= 0) {
-      ledger.holders.splice(index, 1)
+      const [released] = ledger.holders.splice(index, 1)
+      yield* cancelExpire(released!)
       yield* fill(ledger)
       return yield* save(ledger)
     }

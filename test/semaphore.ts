@@ -18,7 +18,10 @@ const semaphores = {
   queue: Restate.Semaphore.make("e2e-queue", 1),
   lease: Restate.Semaphore.make("e2e-lease", 1, { lease: "3 seconds" }),
   retry: Restate.Semaphore.make("e2e-retry", 1),
-  nested: Restate.Semaphore.make("e2e-nested", 1)
+  nested: Restate.Semaphore.make("e2e-nested", 1),
+  defect: Restate.Semaphore.make("e2e-defect", 1),
+  ensure: Restate.Semaphore.make("e2e-ensure", 1, { lease: "4 seconds" }),
+  timeout: Restate.Semaphore.make("e2e-timeout", 1)
 }
 
 const Event = Schema.Struct({ id: Schema.String, event: Schema.Literals(["enter", "exit", "died"]), at: Schema.Number })
@@ -26,7 +29,7 @@ const Event = Schema.Struct({ id: Schema.String, event: Schema.Literals(["enter"
 export const Holders = Restate.service("Holders", {
   hold: Restate.handler({
     input: Schema.Struct({
-      semaphore: Schema.Literals(["cap", "fifo", "release", "queue", "lease", "retry", "nested"]),
+      semaphore: Schema.Literals(["cap", "fifo", "release", "queue", "lease", "retry", "nested", "defect", "ensure", "timeout"]),
       /** Unique: names the holder in events, and its gate. */
       id: Schema.String,
       /** Holds the permit until `open(id)`, or for this many milliseconds. */
@@ -36,7 +39,15 @@ export const Holders = Restate.service("Holders", {
       /** Under the permit, a step fails twice (step retries), then the first attempt dies (a retry that replays). */
       flaky: Schema.optional(Schema.Boolean),
       /** Takes the permit again inside, with a nested withPermit. */
-      nested: Schema.optional(Schema.Boolean)
+      nested: Schema.optional(Schema.Boolean),
+      /**
+       * Dies under the permit, once entered: "caught" by a catchDefect around withPermit, which
+       * then sleeps `until` milliseconds (durably) and returns "caught"; or, "uncaught", in every
+       * attempt, with a durable step in an Effect.ensuring around withPermit.
+       */
+      die: Schema.optional(Schema.Literals(["caught", "uncaught"])),
+      /** An Effect.timeout (milliseconds) around withPermit, waiting included; then it returns "timed out". */
+      timeout: Schema.optional(Schema.Number)
     }),
     success: Schema.String,
     error: Refused
@@ -55,7 +66,7 @@ const died = new Set<string>()
 const step = (name: string, action: () => void) => Restate.run(name, Effect.sync(action), { success: Schema.Void, error: Schema.Never })
 
 const HoldersLive = Holders.toLayer({
-  hold: ({ semaphore, id, until, fail, flaky, nested }) => Effect.gen(function* () {
+  hold: ({ semaphore, id, until, fail, flaky, nested, die, timeout }) => Effect.gen(function* () {
     const gate = yield* Restate.awakeable(Schema.Void)
     yield* step("enter", () => {
       gates.set(id, gate.id)
@@ -75,6 +86,7 @@ const HoldersLive = Holders.toLayer({
         return yield* Effect.die(new Error("the first attempt dies after the step"))
       }
     }
+    if (die) return yield* Effect.die(new Error("a defect under the permit"))
     yield* until === "opened" ? gate.promise : Restate.sleep(until)
     yield* step("exit", () => {
       events.push({ id, event: "exit", at: Date.now() })
@@ -83,7 +95,13 @@ const HoldersLive = Holders.toLayer({
     return id
   }).pipe(
     effect => nested ? Restate.Semaphore.withPermit(semaphores[semaphore], effect) : effect,
-    Restate.Semaphore.withPermit(semaphores[semaphore])
+    Restate.Semaphore.withPermit(semaphores[semaphore]),
+    effect => die === "caught" ? Effect.catchDefect(effect, () => Effect.as(Restate.sleep(until === "opened" ? 0 : until), "caught")) : effect,
+    effect => die === "uncaught" ? Effect.ensuring(effect, step("ensure", () => {})) : effect,
+    effect => timeout === undefined ? effect : effect.pipe(
+      Effect.timeout(timeout),
+      Effect.catchTag("TimeoutError", () => Effect.succeed("timed out"))
+    )
   ),
   open: id => Effect.gen(function* () {
     const gate = yield* Restate.run("gate", Effect.sync(() => gates.get(id) ?? null), { success: Schema.NullOr(Schema.String), error: Schema.Never })

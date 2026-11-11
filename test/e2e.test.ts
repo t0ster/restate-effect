@@ -167,7 +167,7 @@ void describe("Restate.Semaphore", () => {
     (await call("Holders/events", null) as ReadonlyArray<Event>).filter(e => ids.includes(e.id))
   const entered = async (id: string) => (await events([id])).some(e => e.event === "enter")
   /** Starts a holder without waiting for it; returns its invocation ID, which is its holder ID. */
-  const hold = async (semaphore: string, id: string, options: { until?: "opened" | number; fail?: boolean; flaky?: boolean; nested?: boolean } = {}) => {
+  const hold = async (semaphore: string, id: string, options: { until?: "opened" | number; fail?: boolean; flaky?: boolean; nested?: boolean; die?: "caught" | "uncaught"; timeout?: number } = {}) => {
     const response = await fetch(`${ingress}/Holders/hold/send`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore, id, until: "opened", ...options })
     })
@@ -211,6 +211,10 @@ void describe("Restate.Semaphore", () => {
     }, 30)
     return (await semaphore(name)).grants
   }
+  /** How many lease expiries of a semaphore Restate still has scheduled. */
+  const scheduledExpiries = async (name: string) => (await query(
+    `SELECT count(*) AS n FROM sys_invocation WHERE target_service_name = '_restate-effect.Semaphores' AND target_service_key = '${name}' AND target_handler_name = 'expire' AND status = 'scheduled'`
+  ))[0]!.n as number
   /** The semaphore handlers an invocation sent to, with how often. */
   const sentBy = async (invocationId: string) => Object.fromEntries((await query(
     `SELECT target_handler_name AS handler, count(*) AS n FROM sys_invocation WHERE target_service_name = '_restate-effect.Semaphores' AND invoked_by_id = '${invocationId}' GROUP BY target_handler_name`
@@ -229,6 +233,8 @@ void describe("Restate.Semaphore", () => {
     }
     assert.equal(most, 2)
     assert.equal(await idle("e2e-cap"), 6)
+    // Each release cancels its grant's lease expiry.
+    await waitFor("no expiry scheduled", async () => await scheduledExpiries("e2e-cap") === 0, 30)
   })
 
   void test("waiters get the permit first in, first out", { timeout: 60_000 }, async () => {
@@ -349,5 +355,52 @@ void describe("Restate.Semaphore", () => {
     assert.equal(await idle("e2e-nested"), 2)
     // The nested withPermit sent nothing: it ran under the permit already held.
     assert.deepEqual(await sentBy(nested), { acquire: 1, release: 1 })
+  })
+
+  void test("a defect caught around withPermit releases the permit when the handler ends", { timeout: 60_000 }, async () => {
+    // Caught, then a 3-second durable sleep: it holds the permit until the handler ends.
+    const caught = await hold("defect", "defect-a", { die: "caught", until: 3000 })
+    await waitFor("defect-a to hold", () => entered("defect-a"), 30)
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    assert.deepEqual((await semaphore("e2e-defect")).holders, [caught], "held during the sleep after the catch")
+    assert.deepEqual(await outcome(caught), { status: 200, body: "caught" })
+    assert.equal(await idle("e2e-defect"), 1)
+    assert.deepEqual(await sentBy(caught), { acquire: 1, release: 1 })
+  })
+
+  void test("an uncaught defect keeps the permit across retries, even with a durable finalizer", { timeout: 60_000 }, async () => {
+    // Dies in every attempt; a durable step in an Effect.ensuring around withPermit runs each time.
+    const dying = await hold("ensure", "ensure-a", { die: "uncaught" })
+    await waitFor("ensure-a to hold", () => entered("ensure-a"), 30)
+    const waiter = await hold("ensure", "ensure-b")
+    await waits("e2e-ensure", waiter)
+    await new Promise(resolve => setTimeout(resolve, 2000))   // retries meanwhile
+    assert.deepEqual((await semaphore("e2e-ensure")).holders, [dying], "still the holder")
+    assert.equal(await entered("ensure-b"), false)
+    assert.deepEqual(await sentBy(dying), { acquire: 1 })
+    // Killed, it never releases: its lease (4 seconds) frees the permit for ensure-b.
+    await manage(dying, "kill")
+    await waitFor("ensure-b to hold", () => entered("ensure-b"), 30)
+    await open("ensure-b")
+    assert.equal((await outcome(waiter)).status, 200)
+    assert.equal(await idle("e2e-ensure"), 2)
+  })
+
+  void test("an Effect.timeout around withPermit releases the permit, also while waiting", { timeout: 60_000 }, async () => {
+    const first = await hold("timeout", "timeout-a")
+    await waitFor("timeout-a to hold", () => entered("timeout-a"), 30)
+    // Times out in the queue: it leaves it, so no permit goes to it.
+    const waiter = await hold("timeout", "timeout-b", { timeout: 1000 })
+    assert.deepEqual(await outcome(waiter), { status: 200, body: "timed out" })
+    await waitFor("timeout-b to leave the queue", async () => (await semaphore("e2e-timeout")).waiting.length === 0, 30)
+    await open("timeout-a")
+    assert.equal((await outcome(first)).status, 200)
+    assert.equal(await idle("e2e-timeout"), 1)
+    // Times out holding the permit, inside a durable operation: it releases it.
+    const holder = await hold("timeout", "timeout-c", { timeout: 1000 })
+    assert.deepEqual(await outcome(holder), { status: 200, body: "timed out" })
+    assert.equal(await idle("e2e-timeout"), 2)
+    for (const id of [waiter, holder]) assert.deepEqual(await sentBy(id), { acquire: 1, release: 1 })
+    await waitFor("no expiry scheduled", async () => await scheduledExpiries("e2e-timeout") === 0, 30)
   })
 })
