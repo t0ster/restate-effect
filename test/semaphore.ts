@@ -34,14 +34,16 @@ const semaphores = {
   timeout: Semaphore.make(Semaphores, "e2e-timeout", 1),
   crash: Semaphore.make(Semaphores, "e2e-crash", 1),
   named: Semaphore.make(Limits, "e2e-named", 1),
-  missing: Semaphore.make(Unregistered, "e2e-missing", 1)
+  missing: Semaphore.make(Unregistered, "e2e-missing", 1),
+  /** Its limit comes from the endpoint's environment, so a restart can change it. */
+  limit: Semaphore.make(Semaphores, "e2e-limit", Number(process.env.LIMIT ?? 1))
 }
 
 const Event = Schema.Struct({ id: Schema.String, event: Schema.Literals(["enter", "exit", "died"]), at: Schema.Number })
 
 const Hold = Restate.handler({
     input: Schema.Struct({
-      semaphore: Schema.Literals(["cap", "fifo", "release", "queue", "lease", "retry", "nested", "defect", "ensure", "timeout", "crash", "named", "missing"]),
+      semaphore: Schema.Literals(["cap", "fifo", "release", "queue", "lease", "retry", "nested", "defect", "ensure", "timeout", "crash", "named", "missing", "limit"]),
       /** Unique: names the holder in events, and its gate. */
       id: Schema.String,
       /** Holds the permit until `open(id)`, or for this many milliseconds. */
@@ -140,7 +142,11 @@ const HoldersLive = Holders.toLayer({
 })
 
 if (import.meta.main) HoldersLive.pipe(
-  Layer.provideMerge(Layer.mergeAll(Semaphores.layer, Limits.layer, Unregistered.layerRemote)),
+  Layer.provideMerge(Layer.mergeAll(
+    Semaphores.layer(...Object.values(semaphores).filter(s => s.service === Semaphores) as Array<Semaphore.Semaphore<typeof Semaphores.name>>),
+    Limits.layer(semaphores.named),
+    Unregistered.layerRemote(semaphores.missing)
+  )),
   Layer.provide(Restate.layerHttp),
   layer => HttpRouter.serve(layer, { disableLogger: true }),
   Layer.provide(NodeHttpServer.layer(() => createServer(), { port: Number(process.env.PORT ?? 9080), host: "127.0.0.1" })),

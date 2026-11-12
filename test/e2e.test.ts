@@ -10,6 +10,7 @@ import assert from "node:assert/strict"
 const admin = "http://127.0.0.1:29070"
 const ingress = "http://127.0.0.1:28080"
 const restateEnv = {
+  RESTATE_CLUSTER_NAME: "restate-effect-e2e",
   RESTATE_BIND_ADDRESS: "127.0.0.1:25122",
   RESTATE_ADVERTISED_ADDRESS: "http://127.0.0.1:25122/",
   RESTATE_ADMIN__BIND_ADDRESS: "127.0.0.1:29070",
@@ -550,25 +551,48 @@ const semaphoreTests = (runtime: "node" | "bun", port: number) => describe(`Rest
     assert.equal(await idle("e2e-crash"), 2)
     assert.deepEqual(await sentBy(crashing), { acquire: 1, release: 1 })
   })
+
+  it("a limit changed by a restart applies to an invocation already waiting, without a journal mismatch", { timeout: 90_000 }, async () => {
+    const first = await hold("limit", "limit-a", { until: 8000 })   // a durable sleep: its gate would not survive the restart
+    await waitFor("limit-a to hold", () => entered("limit-a"), 30)
+    const second = await hold("limit", "limit-b")
+    await waits("e2e-limit", second)
+    // The endpoint restarts with the limit raised from 1 to 2, while limit-b waits, suspended.
+    await stop(server)
+    server = start(runtime, ["test/semaphore.ts"], { PORT: String(port), PREFIX: prefix, LIMIT: "2" })
+    await waitFor("the semaphore endpoint", async () => server.output().includes("Listening on"), 30)
+    await register(port)
+    // The next operation of the object applies the new limit: limit-b holds beside limit-a; limit-c waits.
+    const third = await hold("limit", "limit-c")
+    await waitFor("limit-b to hold", () => entered("limit-b"), 30)
+    await waits("e2e-limit", third)
+    assert.deepEqual([...(await semaphore("e2e-limit")).holders].sort(), [first, second].sort())
+    await waitFor("limit-c to hold", () => entered("limit-c"), 30)
+    for (const id of ["limit-b", "limit-c"]) await open(id)
+    for (const id of [first, second, third]) assert.equal((await outcome(id)).status, 200)
+    assert.equal(await idle("e2e-limit"), 3)
+    assert.doesNotMatch(server.output(), /journal mismatch|RT0016|\b570\b/i)
+  })
 })
 void semaphoreTests("node", 29183)
 void semaphoreTests("bun", 29184)
 
-// Upgrading from 0.6: invocations that hold or wait for a permit under 0.6 (Restate.Semaphore)
-// replay under 0.7 (the semaphore subpath) when the endpoint at the same URI is upgraded.
-// Needs the v0.6.0 tag: shallow or tagless checkouts skip (`git fetch origin tag v0.6.0`).
-const hasV060 = spawnSync("git", ["rev-parse", "--verify", "--quiet", "v0.6.0^{commit}"], { stdio: "ignore" }).status === 0
-void test("permits and in-flight invocations carry over from 0.6", {
+// Upgrading from 0.7: the object's state (a ledger with `permits`, waiters with `lease`) carries
+// over. In-flight callers do not (their acquire's body changed), so the upgrade expects none: here
+// they are killed, leaving a permit held and a waiter queued, which the leases they stored reclaim.
+// Needs the v0.7.1 tag: shallow or tagless checkouts skip (`git fetch origin tag v0.7.1`).
+const hasV071 = spawnSync("git", ["rev-parse", "--verify", "--quiet", "v0.7.1^{commit}"], { stdio: "ignore" }).status === 0
+void test("the semaphore state of 0.7 carries over", {
   timeout: 180_000,
-  skip: hasV060 ? false : "tag v0.6.0 missing: run `git fetch origin tag v0.6.0`"
+  skip: hasV071 ? false : "tag v0.7.1 missing: run `git fetch origin tag v0.7.1`"
 }, async () => {
   const port = 29186
   const prefix = "e2e-compat"
   const holders = `${prefix}.Holders`
-  // v0.6.0's sources and fixture, built with this checkout's dependencies.
-  const old = mkdtempSync(join(tmpdir(), "restate-effect-0.6-"))
+  // v0.7.1's sources and fixture, built with this checkout's dependencies.
+  const old = mkdtempSync(join(tmpdir(), "restate-effect-0.7-"))
   try {
-    const archive = spawnSync("sh", ["-c", `git archive v0.6.0 | tar -x -C '${old}'`], { encoding: "utf8" })
+    const archive = spawnSync("sh", ["-c", `git archive v0.7.1 | tar -x -C '${old}'`], { encoding: "utf8" })
     assert.equal(archive.status, 0, archive.stderr)
     symlinkSync(resolve("node_modules"), join(old, "node_modules"))
     const build = spawnSync("bun", ["run", "build"], { cwd: old, encoding: "utf8" })
@@ -585,10 +609,9 @@ void test("permits and in-flight invocations carry over from 0.6", {
       }
       return server
     }
-    /** Holds the permit for `until` milliseconds, a durable sleep. */
-    const hold = async (id: string, until: number) => {
+    const hold = async (id: string) => {
       const response = await fetch(`${ingress}/${holders}/hold/send`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore: "fifo", id, until })
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore: "lease", id, until: 300 })
       })
       assert.ok(response.ok)
       return (await response.json() as { invocationId: string }).invocationId
@@ -596,42 +619,48 @@ void test("permits and in-flight invocations carry over from 0.6", {
     const stateOf = async () => {
       const response = await fetch(`${admin}/query`, {
         method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify({ query: `SELECT key, value_utf8 FROM state WHERE service_name = '${prefix}.Semaphores' AND service_key = 'e2e-fifo'` })
+        body: JSON.stringify({ query: `SELECT key, value_utf8 FROM state WHERE service_name = '${prefix}.Semaphores' AND service_key = 'e2e-lease'` })
       })
       const rows = (await response.json() as { rows: ReadonlyArray<{ key: string; value_utf8: string }> }).rows
       const ledger = rows.find(r => r.key === "ledger")
       return {
-        holders: ledger ? (JSON.parse(ledger.value_utf8) as { holders: ReadonlyArray<{ holder: string }> }).holders.map(h => h.holder) : [],
-        waiting: rows.filter(r => r.key.startsWith("waiter:")).map(r => (JSON.parse(r.value_utf8) as { holder: string }).holder)
+        ledger: ledger ? JSON.parse(ledger.value_utf8) as { permits?: number; holders: ReadonlyArray<{ holder: string }> } : undefined,
+        waiting: rows.filter(r => r.key.startsWith("waiter:")).map(r => JSON.parse(r.value_utf8) as { holder: string; lease?: number })
       }
     }
-    const outcome = async (id: string) => (await fetch(`${ingress}/restate/invocation/${id}/attach`)).status
+    const kill = async (id: string) => assert.ok((await fetch(`${admin}/invocations/${id}/kill`, { method: "PATCH" })).ok)
 
-    // Under 0.6: a holds the permit, sleeping for 10 seconds; b waits for it; both suspend.
+    // Under 0.7: a holds the permit and b waits; then both are killed, so their state stays.
     let server = await serve(old)
     let a: string, b: string
     try {
-      a = await hold("compat-a", 10_000)
-      await waitFor("compat-a to hold", async () => (await stateOf()).holders.includes(a), 30)
-      b = await hold("compat-b", 300)
-      await waitFor("compat-b to wait", async () => (await stateOf()).waiting.includes(b), 30)
+      // a never ends its hold: it dies under the permit, in every attempt.
+      const response = await fetch(`${ingress}/${holders}/hold/send`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ semaphore: "lease", id: "compat-a", until: 60_000 })
+      })
+      a = (await response.json() as { invocationId: string }).invocationId
+      await waitFor("compat-a to hold", async () => (await stateOf()).ledger?.holders.some(h => h.holder === a) ?? false, 30)
+      b = await hold("compat-b")
+      await waitFor("compat-b to wait", async () => (await stateOf()).waiting.some(w => w.holder === b), 30)
+      await kill(a)
+      await kill(b)
+      const state = await stateOf()
+      assert.equal(state.ledger?.permits, 1, "a 0.7 ledger")
+      assert.equal(state.waiting[0]?.lease, 3000, "a 0.7 waiter")
     } finally {
       await stop(server)
     }
 
-    // Under 0.7: a resumes, replaying its 0.6 journal, and releases; b gets the permit.
+    // Under 0.8: c waits until a's lease reclaims its permit, which goes to b's stored waiter, whose lease then reclaims it.
     server = await serve(undefined)
     try {
-      assert.equal(await outcome(a), 200, server.output())
-      assert.equal(await outcome(b), 200, server.output())
-      // a entered under 0.6 and left under 0.7 (its replay did not enter again); b did both under 0.7.
-      const events = (await call(`${holders}/events`, null) as ReadonlyArray<{ id: string; event: string }>).filter(e => e.id.startsWith("compat-"))
-      assert.deepEqual(events.map(e => `${e.id}:${e.event}`), ["compat-a:exit", "compat-b:enter", "compat-b:exit"])
+      const c = await hold("compat-c")
+      assert.equal((await fetch(`${ingress}/restate/invocation/${c}/attach`)).status, 200, server.output())
       await waitFor("the semaphore to be idle", async () => {
-        const { holders, waiting } = await stateOf()
-        return holders.length === 0 && waiting.length === 0
+        const { ledger, waiting } = await stateOf()
+        return ledger?.holders.length === 0 && waiting.length === 0
       }, 30)
-      assert.doesNotMatch(server.output(), /journal mismatch|RT0016|570/i)
+      assert.doesNotMatch(server.output(), /journal mismatch|RT0016|\b570\b/i)
     } finally {
       await stop(server)
     }

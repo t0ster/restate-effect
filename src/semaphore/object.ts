@@ -8,18 +8,24 @@ import { Restate } from "@t0ster/restate-effect"
  * cancelling or killing a holder never stops a handler halfway, and Restate runs the sends from
  * one invocation to one key in the order they were sent.
  *
- * Built only on the package's public API. Its handler names, schemas, state keys and commands are
- * those of 0.6 (`Restate.Semaphore`), so permits and in-flight invocations carry over.
+ * Built only on the package's public API. The object owns the limits (`Limits`, per key), given
+ * to its layer by the serving deployment; each handler journals the limits it uses (a `Restate.run`
+ * first), so one replayed across a deploy that changed them stays consistent. State keys are those
+ * of 0.6 and 0.7: their ledgers' `permits` is ignored, their waiters keep their stored lease.
  */
+
+/** A semaphore's limits: `lease` in milliseconds. */
+export interface Limits {
+  readonly permits: number
+  readonly lease: number
+}
+const LimitsSchema = Schema.NullOr(Schema.Struct({ permits: Schema.Number, lease: Schema.Number }))
 
 const Acquire = Schema.Struct({
   /** The invocation ID. */
   holder: Schema.String,
   /** Resolved once the holder has its permit. */
-  awakeable: Schema.String,
-  permits: Schema.Number,
-  /** Milliseconds. */
-  lease: Schema.Number
+  awakeable: Schema.String
 })
 const Release = Schema.Struct({ holder: Schema.String })
 const Expire = Schema.Struct({ holder: Schema.String, grant: Schema.Number })
@@ -52,8 +58,8 @@ const Holder = Schema.Struct({
   expire: Schema.optional(Schema.String)
 })
 const Ledger = Schema.Struct({
-  /** The latest acquire's. */
-  permits: Schema.Number,
+  /** The limit last applied; informational (0.7 ledgers' is ignored): the configuration's applies. */
+  permits: Schema.optional(Schema.Number),
   holders: Schema.Array(Holder),
   /** Grants so far; each grant's number. */
   grants: Schema.Number,
@@ -62,26 +68,35 @@ const Ledger = Schema.Struct({
   tail: Schema.Number
 })
 interface Ledger {
-  permits: number
+  permits?: number | undefined
   holders: Array<typeof Holder.Type>
   grants: number
   head: number
   tail: number
 }
-const Waiter = Schema.Struct({ holder: Schema.String, awakeable: Schema.String, lease: Schema.Number })
+/** `lease`: milliseconds, stored by 0.7 waiters, which keep it; others get the configuration's at their grant. */
+const Waiter = Schema.Struct({ holder: Schema.String, awakeable: Schema.String, lease: Schema.optional(Schema.Number) })
 type Waiter = typeof Waiter.Type
 const waiterKey = (place: number) => `waiter:${place}`
 const placeKey = (holder: string) => `place:${holder}`
 
 const load = Effect.map(Restate.state.get("ledger", Ledger), (saved): Ledger =>
-  saved === null ? { permits: 0, holders: [], grants: 0, head: 0, tail: 0 } : { ...saved, holders: [...saved.holders] })
+  saved === null ? { holders: [], grants: 0, head: 0, tail: 0 } : { ...saved, holders: [...saved.holders] })
 const save = (ledger: Ledger) => Restate.state.set("ledger", Ledger, ledger)
 
-const grantTo = Effect.fnUntraced(function* (service: string, ledger: Ledger, waiter: Waiter) {
+/** The limits of this key, journaled, so a replay across a deploy that changed them sees the same. */
+const limitsOf = (service: string, config: ReadonlyMap<string, Limits>) => Effect.gen(function* () {
+  const name = yield* Restate.key
+  const limits = yield* Restate.run("limits", Effect.sync(() => config.get(name) ?? null), { success: LimitsSchema, error: Schema.Never })
+  if (limits === null) return yield* Effect.die(new Error(`Restate.Semaphore ${service}/${name}: unknown semaphore; give it to ${service}'s layer in the deployment that serves the object`))
+  return limits
+})
+
+const grantTo = Effect.fnUntraced(function* (service: string, ledger: Ledger, limits: Limits, waiter: Waiter) {
   const grant = ++ledger.grants
   // Unless this grant is released by then, `expire` reclaims it.
   const name = yield* Restate.key
-  const expire = yield* clientOf(service).key(name).expire({ holder: waiter.holder, grant }, { discard: true, delay: Duration.millis(waiter.lease) })
+  const expire = yield* clientOf(service).key(name).expire({ holder: waiter.holder, grant }, { discard: true, delay: Duration.millis(waiter.lease ?? limits.lease) })
   ledger.holders.push({ holder: waiter.holder, grant, expire })
   yield* Restate.resolveAwakeable(waiter.awakeable, Schema.Void, undefined)
 })
@@ -91,25 +106,26 @@ const cancelExpire = (holder: typeof Holder.Type) =>
   holder.expire === undefined ? Effect.void : Restate.cancel(holder.expire as Restate.InvocationId)
 
 /** Grants free permits to the queue, first in, first out. */
-const fill = Effect.fnUntraced(function* (service: string, ledger: Ledger) {
-  while (ledger.holders.length < ledger.permits && ledger.head < ledger.tail) {
+const fill = Effect.fnUntraced(function* (service: string, ledger: Ledger, limits: Limits) {
+  while (ledger.holders.length < limits.permits && ledger.head < ledger.tail) {
     const place = ledger.head++
     const waiter = yield* Restate.state.get(waiterKey(place), Waiter)
     if (waiter === null) continue   // it left the queue
     yield* Restate.state.clear(waiterKey(place))
     yield* Restate.state.clear(placeKey(waiter.holder))
-    yield* grantTo(service, ledger, waiter)
+    yield* grantTo(service, ledger, limits, waiter)
   }
 })
 
 /** The object named `service`, implemented. */
-export const layer = (service: string) => contract(service).toLayer({
-  acquire: ({ holder, awakeable, permits, lease }) => Effect.gen(function* () {
+export const layer = (service: string, config: ReadonlyMap<string, Limits>) => contract(service).toLayer({
+  acquire: ({ holder, awakeable }) => Effect.gen(function* () {
+    const limits = yield* limitsOf(service, config)
     const ledger = yield* load
-    ledger.permits = permits
-    // Permits that a larger count frees go to earlier waiters first.
-    yield* fill(service, ledger)
-    const waiter = { holder, awakeable, lease }
+    ledger.permits = limits.permits
+    // Permits that a raised limit frees go to earlier waiters first.
+    yield* fill(service, ledger, limits)
+    const waiter: Waiter = { holder, awakeable }
     if (ledger.holders.some(h => h.holder === holder)) {
       // Acquired again by a holder: it keeps the permit it has.
       yield* Restate.resolveAwakeable(awakeable, Schema.Void, undefined)
@@ -118,9 +134,9 @@ export const layer = (service: string) => contract(service).toLayer({
       if (place !== null) {
         // Acquired again while waiting: wake its latest awakeable.
         yield* Restate.state.set(waiterKey(place), Waiter, waiter)
-      } else if (ledger.holders.length < ledger.permits) {
+      } else if (ledger.holders.length < limits.permits) {
         // A free permit after `fill` means nobody waits.
-        yield* grantTo(service, ledger, waiter)
+        yield* grantTo(service, ledger, limits, waiter)
       } else {
         const last = ledger.tail++
         yield* Restate.state.set(waiterKey(last), Waiter, waiter)
@@ -130,12 +146,13 @@ export const layer = (service: string) => contract(service).toLayer({
     yield* save(ledger)
   }),
   release: ({ holder }) => Effect.gen(function* () {
+    const limits = yield* limitsOf(service, config)
     const ledger = yield* load
     const index = ledger.holders.findIndex(h => h.holder === holder)
     if (index >= 0) {
       const [released] = ledger.holders.splice(index, 1)
       yield* cancelExpire(released!)
-      yield* fill(service, ledger)
+      yield* fill(service, ledger, limits)
       return yield* save(ledger)
     }
     // Still waiting, as when cancelled in the queue: leave it, so no permit goes to it.
@@ -146,12 +163,13 @@ export const layer = (service: string) => contract(service).toLayer({
     }
   }),
   expire: ({ holder, grant }) => Effect.gen(function* () {
+    const limits = yield* limitsOf(service, config)
     const ledger = yield* load
     const index = ledger.holders.findIndex(h => h.holder === holder && h.grant === grant)
     if (index < 0) return   // released, or held under a later grant
     ledger.holders.splice(index, 1)
     yield* Effect.logWarning(`Restate.Semaphore ${yield* Restate.key}: ${holder} held its permit past the lease; reclaimed it`)
-    yield* fill(service, ledger)
+    yield* fill(service, ledger, limits)
     yield* save(ledger)
   })
 })

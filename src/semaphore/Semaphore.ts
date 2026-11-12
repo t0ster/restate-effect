@@ -9,42 +9,46 @@
  */
 import { Context, Duration, Effect, Layer, Schema } from "effect"
 import { Restate } from "@t0ster/restate-effect"
-import { clientOf, layer as objectLayer } from "./object.js"
+import { clientOf, layer as objectLayer, type Limits } from "./object.js"
 
 declare const RegisteredId: unique symbol
 /**
  * Proof that the endpoint serves (or, with `layerRemote`, that another deployment serves) the
- * semaphore object `N`: `withPermit` requires it, so a forgotten registration is a type error.
+ * semaphore `K` of the object `N`: `withPermit` requires it, so a forgotten registration is a type error.
  */
-export interface Registered<N extends string> {
-  readonly [RegisteredId]: (name: N) => N
+export interface Registered<N extends string, K extends string = any> {
+  readonly [RegisteredId]: (name: N, key: K) => [N, K]
 }
 /** What `withPermit` of `S`, or of each semaphore in a union `S`, requires. */
-export type RegisteredOf<S extends Semaphore<any>> = S extends Semaphore<infer N> ? Registered<N> : never
+export type RegisteredOf<S extends Semaphore<any, any>> = S extends Semaphore<infer N, infer K> ? Registered<N, K> : never
 
 /**
- * The virtual object that keeps semaphores' permits, one key per semaphore, with its
- * implementation as `layer`. Register `layer` in the app's endpoint, once in the cluster. Its
- * handlers are internal: only `withPermit` calls them.
+ * The virtual object that keeps semaphores' permits, one key per semaphore, and owns their limits.
+ * Register `layer(...semaphores)` in the app's endpoint, once in the cluster. Its handlers are
+ * internal: only `withPermit` calls them.
  *
  * `Service` without a type argument accepts any semaphore object.
  */
 export interface Service<N extends string = any> {
   /** The object's name in Restate. */
   readonly name: N
-  /** Provided by `layer` and `layerRemote`; required by `withPermit`. */
-  readonly registered: Context.Service<Registered<N>, N>
   /**
-   * Implements the object: registers it with the endpoint, like a `toLayer` Layer, and provides
-   * `Registered<N>`. Provide it to the implementation Layers whose handlers use `withPermit`.
+   * Implements the object for these semaphores, with their limits (`permits`, `lease`): registers
+   * it with the endpoint, like a `toLayer` Layer, and provides `Registered` for each. Provide it to
+   * the implementation Layers whose handlers use `withPermit`. A limit changed here applies on
+   * deploy, from the object's next operation.
    */
-  readonly layer: Layer.Layer<Registered<N>, never, Restate.Endpoint>
+  readonly layer: <const S extends ReadonlyArray<Semaphore<N, any>>>(...semaphores: S) => Layer.Layer<RegisteredOf<S[number]>, never, Restate.Endpoint>
   /**
-   * Provides `Registered<N>` without serving the object, for a deployment that uses permits of an
-   * object that another deployment of the cluster registers.
+   * Provides `Registered` for these semaphores without serving the object, for a deployment that
+   * uses permits of an object that another deployment of the cluster registers. Their limits are
+   * not used here: the serving deployment's apply.
    */
-  readonly layerRemote: Layer.Layer<Registered<N>>
+  readonly layerRemote: <const S extends ReadonlyArray<Semaphore<N, any>>>(...semaphores: S) => Layer.Layer<RegisteredOf<S[number]>>
 }
+
+const registeredKey = (service: string, name: string) =>
+  Context.Service<Registered<any, any>, string>(`restate-effect/Semaphore/Registered/${service}/${name}`)
 
 /**
  * Makes the semaphore object named `name`, unique in the Restate cluster. Every semaphore made
@@ -52,36 +56,55 @@ export interface Service<N extends string = any> {
  *
  * ```ts
  * export const Semaphores = Semaphore.service("app.Semaphores")
- * // in the endpoint: handlers that use withPermit require it
- * GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp))
+ * export const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
+ * // in the endpoint: handlers that use withPermit(gateway) require it
+ * GreeterLive.pipe(Layer.provideMerge(Semaphores.layer(gateway)), Layer.provide(Restate.layerHttp))
  * ```
  */
 export const service = <const N extends string>(name: N): Service<N> => {
-  const registered = Context.Service<Registered<N>, N>(`restate-effect/Semaphore/Registered/${name}`)
-  const layerRemote = Layer.succeed(registered, name)
-  return Object.freeze({ name, registered, layer: Layer.merge(objectLayer(name), layerRemote), layerRemote })
+  const check = (semaphores: ReadonlyArray<Semaphore<any, any>>) => {
+    const limits = new Map<string, Limits>()
+    for (const semaphore of semaphores) {
+      if (semaphore?.service?.name !== name) throw new Error(`${name}.layer: semaphore ${semaphore?.name} belongs to ${semaphore?.service?.name}`)
+      const lease = Math.ceil(Duration.toMillis(semaphore.lease))
+      const known = limits.get(semaphore.name)
+      if (known !== undefined && (known.permits !== semaphore.permits || known.lease !== lease))
+        throw new Error(`${name}.layer: semaphore ${semaphore.name} is given twice, with different limits`)
+      limits.set(semaphore.name, { permits: semaphore.permits, lease })
+    }
+    return limits
+  }
+  const proof = (limits: ReadonlyMap<string, Limits>): Layer.Layer<any> =>
+    Layer.succeedContext([...limits.keys()].reduce((context, key) => Context.add(context, registeredKey(name, key), key), Context.empty() as Context.Context<any>))
+  const layerRemote = (...semaphores: ReadonlyArray<Semaphore<any, any>>) => proof(check(semaphores))
+  const layer = (...semaphores: ReadonlyArray<Semaphore<any, any>>) => {
+    const limits = check(semaphores)
+    return Layer.merge(objectLayer(name, limits), proof(limits))
+  }
+  return Object.freeze({ name, layer, layerRemote }) as Service<N>
 }
 
 /**
  * A durable counting semaphore. Make one with `make`; use it with `withPermit`. `Semaphore`
- * without a type argument accepts any semaphore; `withPermit` of one then requires any
+ * without type arguments accepts any semaphore; `withPermit` of one then requires any
  * `Registered`, so it no longer checks which object's Layer is provided.
  */
-export interface Semaphore<N extends string = any> {
+export interface Semaphore<N extends string = any, K extends string = any> {
   /** The object that keeps its permits. */
   readonly service: Service<N>
   /** Unique in its service: every description with this name and service shares its permits. */
-  readonly name: string
-  /** How many invocations hold a permit at once, at most. */
+  readonly name: K
+  /** How many invocations hold a permit at once, at most: applied by the deployment that serves the object. */
   readonly permits: number
-  /** How long a holder keeps its permit, at most: then the semaphore reclaims it. */
+  /** How long a holder keeps its permit, at most: then the semaphore reclaims it. Applied by the serving deployment. */
   readonly lease: Duration.Duration
 }
 
 /**
- * Describes a semaphore, kept by `service` (see `service`). Its state lives in Restate, so this is a plain value, like a contract.
- * Descriptions with one name should agree; if they do not, each acquire's `permits` applies from
- * then on.
+ * Describes a semaphore, kept by `service` (see `service`). Its state lives in Restate, so this is
+ * a plain value, like a contract. Its limits apply where it is given to `service.layer`: the
+ * object owns them, so changing them is safe on a live server. A raise frees slots at the object's
+ * next operation; a cut does not revoke current holders.
  *
  * `lease` (default 15 minutes) bounds how long a holder keeps its permit, so a killed holder,
  * which never releases it, frees it eventually. A holder that is still running when its lease
@@ -89,8 +112,8 @@ export interface Semaphore<N extends string = any> {
  * suspensions included. The default is above Restate's default inactivity and abort timeouts
  * (1 and 10 minutes): a stuck attempt is retried, keeping its permit, before the lease passes.
  */
-export const make = <N extends string>(service: Service<N>, name: string, permits: number, options?: { readonly lease?: Duration.Input }): Semaphore<N> => {
-  if (typeof service?.name !== "string" || !Context.isKey((service as Partial<Service>).registered)) throw new Error("Semaphore.make needs a service from Semaphore.service")
+export const make = <N extends string, const K extends string>(service: Service<N>, name: K, permits: number, options?: { readonly lease?: Duration.Input }): Semaphore<N, K> => {
+  if (typeof service?.name !== "string" || typeof (service as Partial<Service>).layer !== "function") throw new Error("Semaphore.make needs a service from Semaphore.service")
   if (!name) throw new Error("A Restate semaphore needs a nonempty name")
   if (!Number.isSafeInteger(permits) || permits < 1) throw new Error(`Semaphore ${name}: permits must be a positive integer, got ${permits}`)
   const lease = Duration.fromInputUnsafe(options?.lease ?? "15 minutes")
@@ -101,9 +124,9 @@ export const make = <N extends string>(service: Service<N>, name: string, permit
 /** The semaphores whose permit the current fiber runs under, so that a nested `withPermit` runs under it. */
 const Held = Context.Reference<ReadonlySet<string>>("@t0ster/restate-effect/semaphore/Held", { defaultValue: () => new Set() })
 
-const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | Registered<any>> =>
+const permit = <A, E, R>(self: Semaphore<any, any>, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | Registered<any, any>> =>
   Effect.gen(function* () {
-    yield* self.service.registered
+    yield* registeredKey(self.service.name, self.name)
     const id = `${self.service.name}/${self.name}`
     const held = yield* Held
     if (held.has(id)) return yield* effect
@@ -113,8 +136,7 @@ const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): 
       const granted = yield* Restate.awakeable(Schema.Void)
       // One way, without awaiting the send's invocation ID.
       yield* Restate.fork(semaphore.acquire({
-        holder, awakeable: granted.id, permits: self.permits, lease: Math.ceil(Duration.toMillis(self.lease))
-      }, { discard: true }))
+        holder, awakeable: granted.id }, { discard: true }))
       yield* granted.promise
     })
     // Not awaited, so it works after Effect.timeout interrupted a durable operation that is still pending.
@@ -130,7 +152,7 @@ const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): 
 
 /**
  * Runs `effect` holding one permit, inside a handler of an implementation Layer that is provided
- * the semaphore's `service.layer` (or `layerRemote`), which the types require: waits for a permit durably, first in, first
+ * the semaphore's `service.layer(semaphore, …)` (or `layerRemote`), which the types require: waits for a permit durably, first in, first
  * out (a waiting invocation suspends, holding nothing), runs `effect`, then releases the permit
  * when it succeeds, fails for good, is cancelled or interrupted (as by `Effect.timeout`), also
  * while still waiting, as `Restate.onError` runs; after a caught defect, when the handler ends
@@ -149,7 +171,7 @@ const permit = <A, E, R>(self: Semaphore<any>, effect: Effect.Effect<A, E, R>): 
  * `Restate.sleep` with `Restate.raceAll`.
  */
 export const withPermit: {
-  <S extends Semaphore<any>>(self: S): <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
-  <S extends Semaphore<any>, A, E, R>(self: S, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
-} = ((self: Semaphore<any>, effect?: Effect.Effect<any, any, any>) =>
+  <S extends Semaphore<any, any>>(self: S): <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
+  <S extends Semaphore<any, any>, A, E, R>(self: S, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R | Restate.Invocation | RegisteredOf<S>>
+} = ((self: Semaphore<any, any>, effect?: Effect.Effect<any, any, any>) =>
   effect === undefined ? (effect: Effect.Effect<any, any, any>) => permit(self, effect) : permit(self, effect)) as any
