@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0
+
+**Breaking:** the semaphore is removed. The `@t0ster/restate-effect/semaphore` subpath export and `src/semaphore/` are gone; the library has no semaphore code.
+
+Apps that used it now own their copy, built on the public API (`Restate.ensuring`, awakeables, one-way sends, `Restate.cancel`, state). Keep the object's name, handlers and state to carry permits over.
+
 ## 0.8.0
 
 **Breaking:** semaphore limits are owned by the semaphore object, not sent with each request.
