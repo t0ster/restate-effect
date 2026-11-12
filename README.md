@@ -125,10 +125,12 @@ import { Semaphore } from "@t0ster/restate-effect/semaphore"
 // Shared, like a contract: the object that keeps the app's semaphores.
 export const Semaphores = Semaphore.service("my-app.Semaphores")
 
-// The endpoint: register it once, provided to the implementation Layers whose handlers use permits.
-GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp) /* , … */)
+// Next to the code that uses it: a description, with its limits.
+export const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
 
-const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
+// The endpoint: register the object once, with the semaphores it serves (their limits apply here),
+// provided to the implementation Layers whose handlers use permits.
+GreeterLive.pipe(Layer.provideMerge(Semaphores.layer(gateway /* , … */)), Layer.provide(Restate.layerHttp))
 
 // Inside handlers: at most 4 of these steps run at once.
 const complete = (prompt: string) =>
@@ -137,8 +139,9 @@ const complete = (prompt: string) =>
   )
 ```
 
-- **A semaphore is a description; its permits live in Restate.** `Semaphore.service(name)` describes the virtual object that keeps the permits, with its implementation as `.layer`. Its handlers are internal (and ingress-private): only `withPermit` calls them. One object holds any number of semaphores, one key each; within an object, a semaphore's name is unique: everything that uses the name shares its permits.
-- **A forgotten registration is a type error.** `withPermit` requires `Registered<"my-app.Semaphores">`, which only `Semaphores.layer` provides, so handlers that use permits leave it in their Layer's requirements until it is provided. A deployment that uses an object another deployment registers provides `Semaphores.layerRemote` instead. If no deployment registers it after all, Restate rejects `withPermit`'s first send: the attempt fails with `RT0018` ("the service handler … was not found") and is retried per the handler's retry policy, then paused or failed once its attempts run out (`onDefect`).
+- **A semaphore is a description; its permits live in Restate.** `Semaphore.service(name)` describes the virtual object that keeps the permits, with its implementation as `.layer(...semaphores)`. Its handlers are internal (and ingress-private): only `withPermit` calls them. One object holds any number of semaphores, one key each; within an object, a semaphore's name is unique: everything that uses the name shares its permits.
+- **The object owns the limits.** Requests carry only the holder; the object looks up `permits` and `lease` of the semaphore in the configuration it was given (`Semaphores.layer(gateway, …)`), and records them in its journal per operation. So changing a limit is safe on a live server: it applies on deploy, from the next grant. A raise frees slots at the object's next operation (an acquire, release or expiry); a cut does not revoke current holders. A key the object was not given is a defect, with a message naming it.
+- **A forgotten registration is a type error.** `withPermit(gateway)` requires `Registered<"my-app.Semaphores", "llm-gateway">`, which only `Semaphores.layer(gateway, …)` provides, so handlers that use permits leave it in their Layer's requirements until the object is served with that semaphore. A deployment that uses an object another deployment registers provides `Semaphores.layerRemote(gateway, …)` instead: callers need no limits (those given to `layerRemote` are not used); only the serving deployment's apply. If no deployment registers it after all, Restate rejects `withPermit`'s first send: the attempt fails with `RT0018` ("the service handler … was not found") and is retried per the handler's retry policy, then paused or failed once its attempts run out (`onDefect`).
 - **Waiting is durable and first in, first out.** A waiting invocation suspends, holding nothing.
 - **The permit is released as `Restate.ensuring` runs its cleanup** (`withPermit` is built on it, keyed by the semaphore): when the effect succeeds, fails for good, is cancelled or interrupted, including while it still waits. After a defect caught around it (`Effect.catchDefect`, `Effect.exit`, …), the permit is released when the invocation ends, or at the next `withPermit` of the same semaphore; an uncaught defect only ends the attempt, so the retry keeps the permit.
 - **Durable cleanup around `withPermit` belongs in `Restate.ensuring` or `Restate.onError`**, not `Effect.ensuring`, `onExit` or `acquireRelease` (see [Durable cleanup](#durable-cleanup)).
@@ -146,6 +149,20 @@ const complete = (prompt: string) =>
 - **A lease bounds a lost permit.** A killed invocation never releases its permit: the semaphore reclaims a permit held longer than the lease, 15 minutes unless `make(service, name, permits, { lease })` sets it. A holder still running then loses its permit without knowing, so set the lease above the longest hold, retries and suspensions included. The lease cannot be renewed yet; a release cancels its lease's scheduled expiry.
 - **Wide types.** `Semaphore.Semaphore` and `Semaphore.Service` without a type argument accept any semaphore or object, for fields and helpers; `withPermit` of such a semaphore is satisfied by any object's Layer, so the check of which one is lost.
 - **Limits.** Each semaphore is one virtual-object key, so its acquires and releases run one at a time: a few hundred per second at most. The app registers the object once; if several deployments register it, Restate routes it to the latest, so keep them on compatible library versions.
+
+### Migrating from 0.7
+
+0.8.0 moves the limits from the requests to the object (see [CHANGELOG](CHANGELOG.md)). `layer` and `layerRemote` become functions of the semaphores:
+
+```diff
+ export const gateway = Semaphore.make(Semaphores, "llm-gateway", 4)
+-GreeterLive.pipe(Layer.provideMerge(Semaphores.layer), Layer.provide(Restate.layerHttp))
++GreeterLive.pipe(Layer.provideMerge(Semaphores.layer(gateway)), Layer.provide(Restate.layerHttp))
+-Layer.provide(Semaphores.layerRemote)
++Layer.provide(Semaphores.layerRemote(gateway))
+```
+
+`acquire`'s body changed (`{ holder, awakeable }`), so an invocation that sent it under 0.7 fails to replay under 0.8 (journal mismatch). **Upgrade when no permit is held or awaited.** The object's state carries over: 0.7 ledgers work (their `permits` is ignored) and queued waiters keep their stored lease.
 
 ### Migrating from 0.6
 

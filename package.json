@@ -1,6 +1,6 @@
 {
   "name": "@t0ster/restate-effect",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Restate services for Effect: handlers are Effects, errors are typed across the wire, durable operations compose like Effects",
   "license": "MIT",
   "author": "Roman Dolgyi <tosters@gmail.com>",
